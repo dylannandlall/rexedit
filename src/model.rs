@@ -119,14 +119,22 @@ pub enum ByteColorMode {
     Alternating,
     ByteClass,
     HighNibble,
+    LowNibble,
+    ZeroBytes,
+    Printable,
+    ValueBands,
 }
 
 impl ByteColorMode {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 8] = [
         Self::Plain,
         Self::Alternating,
         Self::ByteClass,
         Self::HighNibble,
+        Self::LowNibble,
+        Self::ZeroBytes,
+        Self::Printable,
+        Self::ValueBands,
     ];
 
     pub fn next(self) -> Self {
@@ -145,6 +153,10 @@ impl ByteColorMode {
             Self::Alternating => "alternating bytes",
             Self::ByteClass => "byte classes",
             Self::HighNibble => "high-nibble bands",
+            Self::LowNibble => "low-nibble bands",
+            Self::ZeroBytes => "zero vs non-zero",
+            Self::Printable => "printable vs binary",
+            Self::ValueBands => "four value bands",
         }
     }
 }

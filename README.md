@@ -21,6 +21,8 @@ side-by-side diffs, customizable themes, and entropy visualization.
 - Per-file Shannon entropy graph
 - Custom themes and byte-coloring patterns
 - Configurable 16- or 32-byte rows, casing, offsets, ASCII, and side panes
+- Optional compression of long runs of uniform byte rows
+- Persistent Python analysis console with a mutable byte-buffer snapshot
 
 ## Requirements
 
@@ -196,8 +198,10 @@ aligned.
 | `Enter` | Edit the selected field |
 | `d` | Delete the selected field |
 | `Ctrl+O` / `Ctrl+L` | Save or load an overlay |
+| `p` | Open the Python buffer console |
 | `s` | Open viewer settings |
 | `t` | Open theme customization |
+| `Ctrl+Z` | Suspend on Unix; resume with the shell built-in `fg` |
 
 ### Overwrite Mode
 
@@ -256,7 +260,11 @@ paths. The suggested filename is:
 
 Themes can customize hexadecimal, ASCII, offset, border, selection, search,
 and modified-byte colors. Available byte-coloring modes include plain,
-alternating bytes, byte classes, and high-nibble bands.
+alternating bytes, byte classes, high- and low-nibble bands, zero-byte and
+printable-byte emphasis, and four value bands.
+
+Press `Ctrl+R` inside either the theme or settings menu to open a `y`/`n`
+confirmation before restoring defaults.
 
 Viewer settings include:
 
@@ -265,6 +273,40 @@ Viewer settings include:
 - uppercase or lowercase hexadecimal;
 - showing or hiding offsets;
 - showing or hiding the field and inspector panes.
+- compressing runs of at least three full rows containing one repeated byte.
+
+## Python buffer console
+
+Press `p` in View Mode to start a persistent Python 3 subprocess for the
+active binary. Python must be available as `python`, `python3`, or through the
+`PYTHON` environment variable.
+
+The console provides:
+
+- `buffer`, a mutable `bytearray` snapshot of the complete binary;
+- `selected`, a view of the selection that was active when the pane opened;
+- `selection_start` and `selection_end`;
+- preloaded `struct`, `binascii`, `hashlib`, `base64`, `zlib`, `math`, `re`,
+  and `pathlib` modules.
+
+Expressions print their result and variables persist between commands. Enter
+`:apply` to copy same-length changes from `buffer` back into rexedit. Length
+changes are rejected because the editor currently supports byte overwrite,
+not insertion or deletion. Press `Ctrl+L` to clear the pane and Escape to
+close it.
+
+The console executes code with the same operating-system permissions as
+rexedit, so only run Python code you trust.
+
+## Unix suspension
+
+On Unix terminals, `Ctrl+Z` restores the terminal and suspends rexedit through
+normal shell job control. Resume it with the shell built-in `fg`.
+
+A separate `rfg` executable cannot reliably foreground the stopped process:
+the parent shell owns the terminal's foreground process group and job table.
+Windows terminals do not provide the equivalent POSIX job-control mechanism,
+so `Ctrl+Z` reports that suspension is unavailable there.
 
 ## Development
 

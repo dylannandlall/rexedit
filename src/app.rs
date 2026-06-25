@@ -15,6 +15,8 @@ use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
     MouseEventKind,
 };
+#[cfg(unix)]
+use crossterm::execute;
 use ratatui::{DefaultTerminal, layout::Rect};
 
 use crate::{
@@ -22,6 +24,7 @@ use crate::{
         ByteColorMode, DEFAULT_BYTES_PER_ROW, Field, FieldColor, NamedColor, Overlay, SearchMatch,
         Selection, Theme,
     },
+    python::PythonSession,
     search::{self, SearchMessage, SearchWorker},
     ui,
 };
@@ -57,7 +60,15 @@ pub enum Mode {
     Path(PathDialog),
     Theme(ThemeEditor),
     Settings(SettingsEditor),
+    ConfirmReset(ResetTarget),
+    Python(PythonPane),
     Help(HelpViewer),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResetTarget {
+    Theme,
+    Settings,
 }
 
 #[derive(Debug, Default)]
@@ -162,6 +173,14 @@ pub struct SettingsEditor {
     pub active: usize,
 }
 
+#[derive(Debug)]
+pub struct PythonPane {
+    pub input: TextInput,
+    pub output: Vec<String>,
+    pub session: PythonSession,
+    pub pending: usize,
+}
+
 #[derive(Debug, Default)]
 pub struct HelpViewer {
     pub scroll: usize,
@@ -174,6 +193,7 @@ pub struct ViewerSettings {
     pub uppercase_hex: bool,
     pub show_offsets: bool,
     pub show_sidebar: bool,
+    pub compress_repeated_rows: bool,
 }
 
 impl Default for ViewerSettings {
@@ -184,6 +204,39 @@ impl Default for ViewerSettings {
             uppercase_hex: true,
             show_offsets: true,
             show_sidebar: true,
+            compress_repeated_rows: false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DisplayRow {
+    Bytes {
+        offset: usize,
+    },
+    Repeated {
+        start: usize,
+        end: usize,
+        byte: u8,
+        physical_rows: usize,
+    },
+}
+
+impl DisplayRow {
+    pub fn start(self) -> usize {
+        match self {
+            Self::Bytes { offset } => offset,
+            Self::Repeated { start, .. } => start,
+        }
+    }
+
+    pub fn end(self, bytes_per_row: usize, byte_len: usize) -> usize {
+        match self {
+            Self::Bytes { offset } => offset
+                .saturating_add(bytes_per_row)
+                .min(byte_len)
+                .saturating_sub(1),
+            Self::Repeated { end, .. } => end,
         }
     }
 }
@@ -230,6 +283,7 @@ pub struct App {
     pub fields_area: Rect,
     pub theme: Theme,
     pub settings: ViewerSettings,
+    pub display_rows: Vec<DisplayRow>,
     pub edit_mode: bool,
     pub edit_high_nibble: bool,
     pub modified_offsets: BTreeSet<usize>,
@@ -244,7 +298,7 @@ pub struct App {
 impl App {
     pub fn new(path: PathBuf, bytes: Vec<u8>) -> Self {
         let selection = (!bytes.is_empty()).then(|| Selection::new(0));
-        Self {
+        let mut app = Self {
             path,
             saved_bytes: Arc::new(bytes.clone()),
             bytes: Arc::new(bytes),
@@ -261,6 +315,7 @@ impl App {
             fields_area: Rect::default(),
             theme: Theme::default(),
             settings: ViewerSettings::default(),
+            display_rows: Vec::new(),
             edit_mode: false,
             edit_high_nibble: true,
             modified_offsets: BTreeSet::new(),
@@ -270,7 +325,9 @@ impl App {
             mouse_dragging: false,
             quit_armed: false,
             entropy: None,
-        }
+        };
+        app.rebuild_display_rows();
+        app
     }
 
     pub fn entropy_profile(&mut self) -> &[f64] {
@@ -328,19 +385,26 @@ impl Workspace {
         loop {
             for document in &mut self.documents {
                 document.drain_search_messages();
+                document.drain_python_messages();
             }
             terminal.draw(|frame| ui::render_workspace(frame, self))?;
             if !event::poll(Duration::from_millis(40))? {
                 continue;
             }
             match event::read()? {
-                Event::Key(key)
-                    if key.kind == KeyEventKind::Press && self.handle_workspace_key(key)? =>
-                {
-                    for document in &mut self.documents {
-                        document.cancel_search();
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                        && key.code == KeyCode::Char('z')
+                    {
+                        self.suspend(terminal)?;
+                        continue;
                     }
-                    return Ok(());
+                    if self.handle_workspace_key(key)? {
+                        for document in &mut self.documents {
+                            document.cancel_search();
+                        }
+                        return Ok(());
+                    }
                 }
                 Event::Mouse(mouse) => self.handle_workspace_mouse(mouse),
                 _ => {}
@@ -487,11 +551,32 @@ impl Workspace {
             }
         }
     }
+
+    #[cfg(unix)]
+    fn suspend(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
+        execute!(io::stdout(), crossterm::event::DisableMouseCapture)?;
+        ratatui::restore();
+        // SAFETY: SIGTSTP is raised for the current process after terminal state is restored.
+        unsafe {
+            libc::raise(libc::SIGTSTP);
+        }
+        *terminal = ratatui::init();
+        execute!(io::stdout(), crossterm::event::EnableMouseCapture)?;
+        self.status = "Resumed from shell job control".into();
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn suspend(&mut self, _terminal: &mut DefaultTerminal) -> io::Result<()> {
+        self.status =
+            "Ctrl+Z suspension requires Unix job control; it is unavailable on Windows".into();
+        Ok(())
+    }
 }
 
 impl App {
     pub fn row_count(&self) -> usize {
-        self.bytes.len().div_ceil(self.settings.bytes_per_row)
+        self.display_rows.len()
     }
 
     pub fn max_scroll(&self) -> usize {
@@ -527,7 +612,7 @@ impl App {
     }
 
     pub fn ensure_visible(&mut self, offset: usize) {
-        let row = offset / self.settings.bytes_per_row;
+        let row = self.display_row_for_offset(offset);
         if row < self.scroll {
             self.scroll = row;
         } else if row >= self.scroll.saturating_add(self.visible_rows) {
@@ -567,6 +652,33 @@ impl App {
                     self.theme.hex_secondary
                 }
             }
+            ByteColorMode::LowNibble => {
+                if byte & 0x0F < 8 {
+                    self.theme.hex_primary
+                } else {
+                    self.theme.hex_secondary
+                }
+            }
+            ByteColorMode::ZeroBytes => {
+                if byte == 0 {
+                    self.theme.hex_secondary
+                } else {
+                    self.theme.hex_primary
+                }
+            }
+            ByteColorMode::Printable => {
+                if byte.is_ascii_graphic() || byte == b' ' {
+                    self.theme.hex_secondary
+                } else {
+                    self.theme.hex_primary
+                }
+            }
+            ByteColorMode::ValueBands => match byte >> 6 {
+                0 => self.theme.offset,
+                1 => self.theme.hex_secondary,
+                2 => self.theme.hex_primary,
+                _ => self.theme.modified,
+            },
         }
     }
 
@@ -595,6 +707,14 @@ impl App {
             }
             Mode::Settings(_) => {
                 self.handle_settings_key(key);
+                Ok(false)
+            }
+            Mode::ConfirmReset(_) => {
+                self.handle_reset_confirmation_key(key);
+                Ok(false)
+            }
+            Mode::Python(_) => {
+                self.handle_python_key(key);
                 Ok(false)
             }
             Mode::Help(_) => {
@@ -650,6 +770,7 @@ impl App {
             }
             KeyCode::Char('t') => self.mode = Mode::Theme(ThemeEditor::default()),
             KeyCode::Char('s') => self.mode = Mode::Settings(SettingsEditor::default()),
+            KeyCode::Char('p') => self.open_python_pane(),
             KeyCode::Char('n') => self.next_search_result(),
             KeyCode::Char('N') => self.previous_search_result(),
             KeyCode::Tab => {
@@ -894,6 +1015,7 @@ impl App {
                 KeyCode::Char('s') => self.open_path_dialog(PathAction::SaveTheme),
                 KeyCode::Char('l') => self.open_path_dialog(PathAction::LoadTheme),
                 KeyCode::Char('u') if active == 0 => self.theme.name.clear(),
+                KeyCode::Char('r') => self.mode = Mode::ConfirmReset(ResetTarget::Theme),
                 _ => {}
             }
             return;
@@ -925,16 +1047,20 @@ impl App {
             Mode::Settings(editor) => editor.active,
             _ => return,
         };
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('r') {
+            self.mode = Mode::ConfirmReset(ResetTarget::Settings);
+            return;
+        }
         match key.code {
             KeyCode::Esc | KeyCode::Enter => self.mode = Mode::Normal,
             KeyCode::Tab | KeyCode::Down => {
                 if let Mode::Settings(editor) = &mut self.mode {
-                    editor.active = (editor.active + 1) % 5;
+                    editor.active = (editor.active + 1) % 6;
                 }
             }
             KeyCode::BackTab | KeyCode::Up => {
                 if let Mode::Settings(editor) = &mut self.mode {
-                    editor.active = editor.active.checked_sub(1).unwrap_or(4);
+                    editor.active = editor.active.checked_sub(1).unwrap_or(5);
                 }
             }
             KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') => {
@@ -942,6 +1068,174 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    fn handle_reset_confirmation_key(&mut self, key: KeyEvent) {
+        let target = match self.mode {
+            Mode::ConfirmReset(target) => target,
+            _ => return,
+        };
+        match key.code {
+            KeyCode::Char('y' | 'Y') => match target {
+                ResetTarget::Theme => {
+                    self.theme = Theme::default();
+                    self.status = "Theme reset to defaults".into();
+                    self.mode = Mode::Theme(ThemeEditor::default());
+                }
+                ResetTarget::Settings => {
+                    self.settings = ViewerSettings::default();
+                    self.rebuild_display_rows();
+                    if let Some(selection) = self.selection {
+                        self.ensure_visible(selection.cursor);
+                    }
+                    self.status = "Viewer settings reset to defaults".into();
+                    self.mode = Mode::Settings(SettingsEditor::default());
+                }
+            },
+            KeyCode::Char('n' | 'N') | KeyCode::Esc => {
+                self.status = "Reset cancelled".into();
+                self.mode = match target {
+                    ResetTarget::Theme => Mode::Theme(ThemeEditor::default()),
+                    ResetTarget::Settings => Mode::Settings(SettingsEditor::default()),
+                };
+            }
+            _ => {
+                self.status = "Type y to reset or n to cancel".into();
+            }
+        }
+    }
+
+    fn open_python_pane(&mut self) {
+        let Some(selection) = self.selection else {
+            self.status = "Select at least one byte before opening Python".into();
+            return;
+        };
+        match PythonSession::start(
+            &self.bytes,
+            selection.start().min(self.bytes.len().saturating_sub(1)),
+            selection.end().min(self.bytes.len().saturating_sub(1)),
+        ) {
+            Ok(session) => {
+                self.mode = Mode::Python(PythonPane {
+                    input: TextInput::default(),
+                    output: vec![
+                        "Python 3 analysis console".into(),
+                        "Available: buffer, selected, selection_start/end".into(),
+                        "Preloaded: struct, binascii, hashlib, base64, zlib, math, re, pathlib"
+                            .into(),
+                        "Use :apply to copy same-length buffer edits back into rexedit.".into(),
+                    ],
+                    session,
+                    pending: 0,
+                });
+                self.status = "Python pane opened".into();
+            }
+            Err(error) => self.status = error,
+        }
+    }
+
+    fn handle_python_key(&mut self, key: KeyEvent) {
+        if key.code == KeyCode::Esc {
+            self.mode = Mode::Normal;
+            self.status = "Python pane closed".into();
+            return;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('l') {
+            if let Mode::Python(pane) = &mut self.mode {
+                pane.output.clear();
+            }
+            return;
+        }
+        if key.code == KeyCode::Enter {
+            let command = match &mut self.mode {
+                Mode::Python(pane) => std::mem::take(&mut pane.input.value),
+                _ => return,
+            };
+            if command.trim().is_empty() {
+                return;
+            }
+            let result = if let Mode::Python(pane) = &mut self.mode {
+                pane.output.push(format!(">>> {command}"));
+                let result = if command.trim() == ":apply" {
+                    pane.session.apply()
+                } else {
+                    pane.session.execute(command)
+                };
+                if result.is_ok() {
+                    pane.pending += 1;
+                }
+                result
+            } else {
+                return;
+            };
+            if let Err(error) = result {
+                self.status = error;
+            }
+            return;
+        }
+        if let Mode::Python(pane) = &mut self.mode {
+            pane.input.handle_key(key);
+        }
+    }
+
+    fn drain_python_messages(&mut self) {
+        let responses = match &mut self.mode {
+            Mode::Python(pane) => pane.session.responses.try_iter().collect::<Vec<_>>(),
+            _ => return,
+        };
+        for response in responses {
+            let snapshot = match &mut self.mode {
+                Mode::Python(pane) => {
+                    pane.pending = pane.pending.saturating_sub(1);
+                    if !response.output.is_empty() {
+                        pane.output
+                            .extend(response.output.lines().map(str::to_owned));
+                    }
+                    if let Some(error) = response.error {
+                        pane.output.push(error);
+                    }
+                    response.applied.then(|| pane.session.snapshot.clone())
+                }
+                _ => None,
+            };
+            if let Some(snapshot) = snapshot {
+                self.apply_python_snapshot(&snapshot);
+            }
+        }
+    }
+
+    fn apply_python_snapshot(&mut self, snapshot: &Path) {
+        let bytes = match fs::read(snapshot) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.status = format!("Could not read Python buffer: {error}");
+                return;
+            }
+        };
+        if bytes.len() != self.bytes.len() {
+            self.status = format!(
+                "Python buffer length changed from {} to {}; only same-length edits can be applied",
+                self.bytes.len(),
+                bytes.len()
+            );
+            return;
+        }
+        self.cancel_search();
+        self.search.results.clear();
+        self.bytes = Arc::new(bytes);
+        self.modified_offsets = self
+            .bytes
+            .iter()
+            .zip(self.saved_bytes.iter())
+            .enumerate()
+            .filter_map(|(offset, (current, saved))| (current != saved).then_some(offset))
+            .collect();
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.pending_edit = None;
+        self.entropy = None;
+        self.rebuild_display_rows();
+        self.status = "Applied Python buffer; Ctrl+S in Overwrite Mode saves it".into();
     }
 
     fn handle_help_key(&mut self, key: KeyEvent) {
@@ -1020,6 +1314,10 @@ impl App {
         let local_row = row.checked_sub(inner_top)?;
         let local_x = column.checked_sub(inner_left)?;
         let data_row = self.scroll.checked_add(usize::from(local_row))?;
+        let display_row = *self.display_rows.get(data_row)?;
+        if let DisplayRow::Repeated { start, .. } = display_row {
+            return Some(start);
+        }
         let prefix_width = if self.settings.show_offsets { 10 } else { 0 };
         let hex_width =
             self.settings.bytes_per_row * 3 + self.settings.bytes_per_row.saturating_sub(1) / 8;
@@ -1040,9 +1338,7 @@ impl App {
         } else {
             None
         }?;
-        let offset = data_row
-            .checked_mul(self.settings.bytes_per_row)?
-            .checked_add(byte_column)?;
+        let offset = display_row.start().checked_add(byte_column)?;
         if offset < self.bytes.len() {
             Some(offset)
         } else {
@@ -1115,6 +1411,7 @@ impl App {
             (original & 0xF0) | nibble
         };
         self.entropy = None;
+        self.rebuild_display_rows();
         self.update_dirty_offset(offset);
         if self.edit_high_nibble {
             self.edit_high_nibble = false;
@@ -1154,6 +1451,7 @@ impl App {
         self.search.results.clear();
         Arc::make_mut(&mut self.bytes)[action.offset] = action.before;
         self.entropy = None;
+        self.rebuild_display_rows();
         self.update_dirty_offset(action.offset);
         self.redo_stack.push(action);
         self.selection = Some(Selection::new(action.offset));
@@ -1171,6 +1469,7 @@ impl App {
         self.search.results.clear();
         Arc::make_mut(&mut self.bytes)[action.offset] = action.after;
         self.entropy = None;
+        self.rebuild_display_rows();
         self.update_dirty_offset(action.offset);
         self.undo_stack.push(action);
         self.selection = Some(Selection::new(action.offset));
@@ -1195,6 +1494,7 @@ impl App {
                 } else {
                     16
                 };
+                self.rebuild_display_rows();
                 if let Some(selection) = self.selection {
                     self.ensure_visible(selection.cursor);
                 }
@@ -1202,7 +1502,71 @@ impl App {
             2 => self.settings.uppercase_hex = !self.settings.uppercase_hex,
             3 => self.settings.show_offsets = !self.settings.show_offsets,
             4 => self.settings.show_sidebar = !self.settings.show_sidebar,
+            5 => {
+                self.settings.compress_repeated_rows = !self.settings.compress_repeated_rows;
+                self.rebuild_display_rows();
+                if let Some(selection) = self.selection {
+                    self.ensure_visible(selection.cursor);
+                }
+            }
             _ => {}
+        }
+    }
+
+    pub fn set_bytes_per_row(&mut self, bytes_per_row: usize) {
+        if self.settings.bytes_per_row != bytes_per_row {
+            self.settings.bytes_per_row = bytes_per_row;
+            self.rebuild_display_rows();
+        }
+    }
+
+    pub fn display_row_for_offset(&self, offset: usize) -> usize {
+        let index = self
+            .display_rows
+            .partition_point(|row| row.end(self.settings.bytes_per_row, self.bytes.len()) < offset);
+        index.min(self.display_rows.len().saturating_sub(1))
+    }
+
+    fn rebuild_display_rows(&mut self) {
+        self.display_rows.clear();
+        let bytes_per_row = self.settings.bytes_per_row.max(1);
+        let physical_rows = self.bytes.len().div_ceil(bytes_per_row);
+        let mut row = 0;
+        while row < physical_rows {
+            let offset = row * bytes_per_row;
+            if self.settings.compress_repeated_rows && offset + bytes_per_row <= self.bytes.len() {
+                let byte = self.bytes[offset];
+                let uniform = self.bytes[offset..offset + bytes_per_row]
+                    .iter()
+                    .all(|candidate| *candidate == byte);
+                if uniform {
+                    let mut run_end = row + 1;
+                    while run_end < physical_rows {
+                        let next = run_end * bytes_per_row;
+                        if next + bytes_per_row > self.bytes.len()
+                            || !self.bytes[next..next + bytes_per_row]
+                                .iter()
+                                .all(|candidate| *candidate == byte)
+                        {
+                            break;
+                        }
+                        run_end += 1;
+                    }
+                    let run_rows = run_end - row;
+                    if run_rows >= 3 {
+                        self.display_rows.push(DisplayRow::Repeated {
+                            start: offset,
+                            end: run_end * bytes_per_row - 1,
+                            byte,
+                            physical_rows: run_rows,
+                        });
+                        row = run_end;
+                        continue;
+                    }
+                }
+            }
+            self.display_rows.push(DisplayRow::Bytes { offset });
+            row += 1;
         }
     }
 
@@ -1774,6 +2138,63 @@ mod tests {
         app.toggle_setting(1);
         assert_eq!(app.settings.bytes_per_row, 32);
         assert_eq!(app.row_count(), 2);
+    }
+
+    #[test]
+    fn repeated_uniform_rows_are_compressed_and_mapped_to_offsets() {
+        let mut bytes = vec![0; 16 * 6];
+        bytes.extend([1; 16]);
+        let mut app = App::new("sample.bin".into(), bytes);
+        app.toggle_setting(5);
+
+        assert_eq!(app.row_count(), 2);
+        assert!(matches!(
+            app.display_rows[0],
+            DisplayRow::Repeated {
+                start: 0,
+                end: 95,
+                byte: 0,
+                physical_rows: 6
+            }
+        ));
+        assert_eq!(app.display_row_for_offset(80), 0);
+        assert_eq!(app.display_row_for_offset(96), 1);
+    }
+
+    #[test]
+    fn settings_reset_requires_confirmation() {
+        let mut app = App::new("sample.bin".into(), vec![0; 64]);
+        app.settings.show_ascii = false;
+        app.mode = Mode::Settings(SettingsEditor::default());
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL))
+            .unwrap();
+        assert!(matches!(
+            app.mode,
+            Mode::ConfirmReset(ResetTarget::Settings)
+        ));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE))
+            .unwrap();
+        assert!(!app.settings.show_ascii);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL))
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.settings.show_ascii);
+    }
+
+    #[test]
+    fn theme_reset_requires_confirmation() {
+        let mut app = App::new("sample.bin".into(), vec![0; 16]);
+        app.theme.byte_mode = ByteColorMode::ValueBands;
+        app.mode = Mode::Theme(ThemeEditor::default());
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL))
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.theme, Theme::default());
+        assert!(matches!(app.mode, Mode::Theme(_)));
     }
 
     #[test]
