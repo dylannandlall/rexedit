@@ -300,7 +300,9 @@ Expressions print their result and variables persist between commands. Enter
 changes are rejected because the editor currently supports byte overwrite,
 not insertion or deletion. Press `Ctrl+L` to clear the pane and Escape to
 close it. Page Up/Page Down and the mouse wheel scroll output history;
-`Ctrl+Home` and `Ctrl+End` jump to the oldest and newest output.
+`Ctrl+Home` and `Ctrl+End` jump to the oldest and newest output. Tab and
+Shift+Tab cycle focus between the hex viewer, fields pane, and Python console
+without ending the interpreter session.
 
 The console executes code with the same operating-system permissions as
 rexedit, so only run Python code you trust.

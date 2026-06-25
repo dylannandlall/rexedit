@@ -34,6 +34,7 @@ pub enum Focus {
     #[default]
     Viewer,
     Fields,
+    Python,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -180,6 +181,17 @@ pub struct PythonPane {
     pub session: PythonSession,
     pub pending: usize,
     pub scroll: usize,
+    pub visible_output_lines: usize,
+}
+
+impl PythonPane {
+    pub fn max_scroll(&self) -> usize {
+        self.output.len().saturating_sub(self.visible_output_lines)
+    }
+
+    pub(crate) fn clamp_scroll(&mut self) {
+        self.scroll = self.scroll.min(self.max_scroll());
+    }
 }
 
 #[derive(Debug, Default)]
@@ -282,6 +294,7 @@ pub struct App {
     pub status: String,
     pub viewer_area: Rect,
     pub fields_area: Rect,
+    pub python_area: Rect,
     pub theme: Theme,
     pub settings: ViewerSettings,
     pub display_rows: Vec<DisplayRow>,
@@ -314,6 +327,7 @@ impl App {
             status: "Ready".into(),
             viewer_area: Rect::default(),
             fields_area: Rect::default(),
+            python_area: Rect::default(),
             theme: Theme::default(),
             settings: ViewerSettings::default(),
             display_rows: Vec::new(),
@@ -795,7 +809,7 @@ impl App {
             KeyCode::Tab => {
                 self.focus = match self.focus {
                     Focus::Viewer => Focus::Fields,
-                    Focus::Fields => Focus::Viewer,
+                    Focus::Fields | Focus::Python => Focus::Viewer,
                 };
             }
             KeyCode::Char('a') => {
@@ -1147,7 +1161,9 @@ impl App {
                     session,
                     pending: 0,
                     scroll: 0,
+                    visible_output_lines: 1,
                 });
+                self.focus = Focus::Python;
                 self.status = "Python pane opened".into();
             }
             Err(error) => self.status = error,
@@ -1157,7 +1173,16 @@ impl App {
     fn handle_python_key(&mut self, key: KeyEvent) {
         if key.code == KeyCode::Esc {
             self.mode = Mode::Normal;
+            self.focus = Focus::Viewer;
             self.status = "Python pane closed".into();
+            return;
+        }
+        if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+            self.cycle_python_focus(key.code == KeyCode::Tab);
+            return;
+        }
+        if self.focus != Focus::Python {
+            self.handle_python_content_key(key);
             return;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('l') {
@@ -1170,7 +1195,8 @@ impl App {
         match key.code {
             KeyCode::PageUp => {
                 if let Mode::Python(pane) = &mut self.mode {
-                    pane.scroll = pane.scroll.saturating_add(10).min(pane.output.len());
+                    pane.scroll = pane.scroll.saturating_add(10);
+                    pane.clamp_scroll();
                 }
                 return;
             }
@@ -1182,7 +1208,7 @@ impl App {
             }
             KeyCode::Home if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if let Mode::Python(pane) = &mut self.mode {
-                    pane.scroll = pane.output.len();
+                    pane.scroll = pane.max_scroll();
                 }
                 return;
             }
@@ -1224,6 +1250,66 @@ impl App {
         }
         if let Mode::Python(pane) = &mut self.mode {
             pane.input.handle_key(key);
+        }
+    }
+
+    fn cycle_python_focus(&mut self, forward: bool) {
+        self.focus = match (self.focus, self.settings.show_sidebar, forward) {
+            (Focus::Viewer, true, true) => Focus::Fields,
+            (Focus::Viewer, false, true) => Focus::Python,
+            (Focus::Fields, _, true) => Focus::Python,
+            (Focus::Python, _, true) => Focus::Viewer,
+            (Focus::Viewer, _, false) => Focus::Python,
+            (Focus::Fields, _, false) => Focus::Viewer,
+            (Focus::Python, true, false) => Focus::Fields,
+            (Focus::Python, false, false) => Focus::Viewer,
+        };
+        self.status = match self.focus {
+            Focus::Viewer => "Python mode: hex viewer focused".into(),
+            Focus::Fields => "Python mode: fields pane focused".into(),
+            Focus::Python => "Python mode: console focused".into(),
+        };
+    }
+
+    fn handle_python_content_key(&mut self, key: KeyEvent) {
+        match (self.focus, key.code) {
+            (Focus::Viewer, KeyCode::Left) => {
+                self.move_cursor(-1, key.modifiers.contains(KeyModifiers::SHIFT));
+            }
+            (Focus::Viewer, KeyCode::Right) => {
+                self.move_cursor(1, key.modifiers.contains(KeyModifiers::SHIFT));
+            }
+            (Focus::Viewer, KeyCode::Up) => self.move_cursor(
+                -(self.settings.bytes_per_row as isize),
+                key.modifiers.contains(KeyModifiers::SHIFT),
+            ),
+            (Focus::Viewer, KeyCode::Down) => self.move_cursor(
+                self.settings.bytes_per_row as isize,
+                key.modifiers.contains(KeyModifiers::SHIFT),
+            ),
+            (Focus::Viewer, KeyCode::PageUp) => self.move_cursor(
+                -(self
+                    .visible_rows
+                    .saturating_mul(self.settings.bytes_per_row) as isize),
+                key.modifiers.contains(KeyModifiers::SHIFT),
+            ),
+            (Focus::Viewer, KeyCode::PageDown) => self.move_cursor(
+                self.visible_rows
+                    .saturating_mul(self.settings.bytes_per_row) as isize,
+                key.modifiers.contains(KeyModifiers::SHIFT),
+            ),
+            (Focus::Viewer, KeyCode::Home) => {
+                self.select_offset(0, key.modifiers.contains(KeyModifiers::SHIFT));
+            }
+            (Focus::Viewer, KeyCode::End) if !self.bytes.is_empty() => {
+                self.select_offset(
+                    self.bytes.len() - 1,
+                    key.modifiers.contains(KeyModifiers::SHIFT),
+                );
+            }
+            (Focus::Fields, KeyCode::Up | KeyCode::Char('[')) => self.select_previous_field(),
+            (Focus::Fields, KeyCode::Down | KeyCode::Char(']')) => self.select_next_field(),
+            _ => {}
         }
     }
 
@@ -1315,10 +1401,17 @@ impl App {
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) {
-        if let Mode::Python(pane) = &mut self.mode {
+        if matches!(self.mode, Mode::Python(_))
+            && self.python_area.contains((mouse.column, mouse.row).into())
+        {
+            self.focus = Focus::Python;
+            let Mode::Python(pane) = &mut self.mode else {
+                return;
+            };
             match mouse.kind {
                 MouseEventKind::ScrollUp => {
-                    pane.scroll = pane.scroll.saturating_add(3).min(pane.output.len());
+                    pane.scroll = pane.scroll.saturating_add(3);
+                    pane.clamp_scroll();
                 }
                 MouseEventKind::ScrollDown => {
                     pane.scroll = pane.scroll.saturating_sub(3);
@@ -1327,9 +1420,24 @@ impl App {
             }
             return;
         }
+        if matches!(self.mode, Mode::Python(_)) {
+            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                if self.viewer_area.contains((mouse.column, mouse.row).into()) {
+                    self.focus = Focus::Viewer;
+                } else if self.fields_area.contains((mouse.column, mouse.row).into()) {
+                    self.focus = Focus::Fields;
+                }
+            }
+            self.handle_content_mouse(mouse);
+            return;
+        }
         if !matches!(self.mode, Mode::Normal) {
             return;
         }
+        self.handle_content_mouse(mouse);
+    }
+
+    fn handle_content_mouse(&mut self, mouse: MouseEvent) {
         match mouse.kind {
             MouseEventKind::ScrollUp => self.scroll = self.scroll.saturating_sub(3),
             MouseEventKind::ScrollDown => {

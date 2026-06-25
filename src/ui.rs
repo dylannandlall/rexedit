@@ -92,8 +92,13 @@ fn render_in(frame: &mut Frame, app: &mut App, area: Rect) {
 
     app.viewer_area = viewer;
     app.fields_area = fields;
+    app.python_area = python_area.unwrap_or_default();
     app.visible_rows = viewer.height.saturating_sub(2) as usize;
     app.scroll = app.scroll.min(app.max_scroll());
+    if let Mode::Python(pane) = &mut app.mode {
+        pane.visible_output_lines = app.python_area.height.saturating_sub(4) as usize;
+        pane.clamp_scroll();
+    }
 
     render_viewer(frame, app, viewer, None, None);
     if app.settings.show_sidebar {
@@ -101,7 +106,7 @@ fn render_in(frame: &mut Frame, app: &mut App, area: Rect) {
         render_inspector(frame, app, inspector);
     }
     if let (Some(area), Mode::Python(pane)) = (python_area, &app.mode) {
-        render_python_pane(frame, pane, area);
+        render_python_pane(frame, pane, area, app.focus == Focus::Python);
     }
     render_status(frame, app, status);
 
@@ -941,7 +946,7 @@ fn render_reset_confirmation(frame: &mut Frame, target: ResetTarget) {
     );
 }
 
-fn render_python_pane(frame: &mut Frame, pane: &PythonPane, area: Rect) {
+fn render_python_pane(frame: &mut Frame, pane: &PythonPane, area: Rect, active: bool) {
     let output_height = area.height.saturating_sub(4) as usize;
     let (start, end) = python_output_range(pane.output.len(), output_height, pane.scroll);
     let mut lines = pane.output[start..end]
@@ -965,20 +970,31 @@ fn render_python_pane(frame: &mut Frame, pane: &PythonPane, area: Rect) {
         Paragraph::new(lines).wrap(Wrap { trim: false }).block(
             Block::default()
                 .title(Span::styled(
-                    " Python console — PgUp/PgDn or wheel scroll | Enter run | :apply sync | Esc close ",
-                    Style::default()
-                        .fg(Color::LightGreen)
-                        .add_modifier(Modifier::BOLD),
+                    " Python console — Tab changes pane | PgUp/PgDn scroll | Enter run | Esc close ",
+                    if active {
+                        Style::default()
+                            .fg(Color::LightGreen)
+                            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                    } else {
+                        Style::default()
+                            .fg(Color::Green)
+                            .add_modifier(Modifier::BOLD)
+                    },
                 ))
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Green)),
+                .border_style(Style::default().fg(if active {
+                    Color::LightGreen
+                } else {
+                    Color::Green
+                })),
         ),
         area,
     );
 }
 
 fn python_output_range(length: usize, height: usize, scroll: usize) -> (usize, usize) {
-    let end = length.saturating_sub(scroll.min(length));
+    let max_scroll = length.saturating_sub(height);
+    let end = length.saturating_sub(scroll.min(max_scroll));
     (end.saturating_sub(height), end)
 }
 
@@ -1088,6 +1104,7 @@ fn keybinding_lines() -> Vec<Line<'static>> {
         Line::from(""),
         section("Python console"),
         binding("Enter", "execute an expression or statement"),
+        binding("Tab / Shift+Tab", "cycle viewer, fields, and Python panes"),
         binding(":apply", "copy same-length buffer edits into rexedit"),
         binding("PgUp/PgDn / wheel", "scroll console output"),
         binding("Ctrl+Home / Ctrl+End", "oldest / newest console output"),
@@ -1218,7 +1235,8 @@ mod tests {
     fn python_output_range_scrolls_back_through_history() {
         assert_eq!(python_output_range(100, 20, 0), (80, 100));
         assert_eq!(python_output_range(100, 20, 10), (70, 90));
-        assert_eq!(python_output_range(8, 20, usize::MAX), (0, 0));
+        assert_eq!(python_output_range(8, 20, usize::MAX), (0, 8));
+        assert_eq!(python_output_range(100, 20, usize::MAX), (0, 20));
     }
 
     #[test]
