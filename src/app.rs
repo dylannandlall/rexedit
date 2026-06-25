@@ -38,6 +38,12 @@ pub enum Focus {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScrollbarDrag {
+    Viewer,
+    Python,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PathAction {
     SaveOverlay,
     LoadOverlay,
@@ -182,6 +188,9 @@ pub struct PythonPane {
     pub pending: usize,
     pub scroll: usize,
     pub visible_output_lines: usize,
+    pub history: Vec<String>,
+    pub history_index: Option<usize>,
+    pub history_draft: String,
 }
 
 impl PythonPane {
@@ -305,6 +314,7 @@ pub struct App {
     redo_stack: Vec<EditAction>,
     pending_edit: Option<PendingEdit>,
     mouse_dragging: bool,
+    scrollbar_dragging: Option<ScrollbarDrag>,
     quit_armed: bool,
     pub entropy: Option<Vec<f64>>,
 }
@@ -338,6 +348,7 @@ impl App {
             redo_stack: Vec::new(),
             pending_edit: None,
             mouse_dragging: false,
+            scrollbar_dragging: None,
             quit_armed: false,
             entropy: None,
         };
@@ -1162,6 +1173,9 @@ impl App {
                     pending: 0,
                     scroll: 0,
                     visible_output_lines: 1,
+                    history: Vec::new(),
+                    history_index: None,
+                    history_draft: String::new(),
                 });
                 self.focus = Focus::Python;
                 self.status = "Python pane opened".into();
@@ -1193,6 +1207,18 @@ impl App {
             return;
         }
         match key.code {
+            KeyCode::Up => {
+                if let Mode::Python(pane) = &mut self.mode {
+                    navigate_python_history(pane, true);
+                }
+                return;
+            }
+            KeyCode::Down => {
+                if let Mode::Python(pane) = &mut self.mode {
+                    navigate_python_history(pane, false);
+                }
+                return;
+            }
             KeyCode::PageUp => {
                 if let Mode::Python(pane) = &mut self.mode {
                     pane.scroll = pane.scroll.saturating_add(10);
@@ -1231,6 +1257,11 @@ impl App {
             let result = if let Mode::Python(pane) = &mut self.mode {
                 pane.output.push(format!(">>> {command}"));
                 pane.scroll = 0;
+                if pane.history.last() != Some(&command) {
+                    pane.history.push(command.clone());
+                }
+                pane.history_index = None;
+                pane.history_draft.clear();
                 let result = if command.trim() == ":apply" {
                     pane.session.apply()
                 } else {
@@ -1250,6 +1281,8 @@ impl App {
         }
         if let Mode::Python(pane) = &mut self.mode {
             pane.input.handle_key(key);
+            pane.history_index = None;
+            pane.history_draft.clear();
         }
     }
 
@@ -1401,6 +1434,9 @@ impl App {
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) {
+        if self.handle_scrollbar_mouse(mouse) {
+            return;
+        }
         if matches!(self.mode, Mode::Python(_))
             && self.python_area.contains((mouse.column, mouse.row).into())
         {
@@ -1470,6 +1506,52 @@ impl App {
             MouseEventKind::Up(MouseButton::Left) => self.mouse_dragging = false,
             _ => {}
         }
+    }
+
+    fn handle_scrollbar_mouse(&mut self, mouse: MouseEvent) -> bool {
+        let drag_target = match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if is_scrollbar_column(self.python_area, mouse.column)
+                    && self.python_area.contains((mouse.column, mouse.row).into())
+                    && matches!(self.mode, Mode::Python(_))
+                {
+                    Some(ScrollbarDrag::Python)
+                } else if is_scrollbar_column(self.viewer_area, mouse.column)
+                    && self.viewer_area.contains((mouse.column, mouse.row).into())
+                {
+                    Some(ScrollbarDrag::Viewer)
+                } else {
+                    None
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => self.scrollbar_dragging,
+            MouseEventKind::Up(MouseButton::Left) => {
+                let was_dragging = self.scrollbar_dragging.take().is_some();
+                return was_dragging;
+            }
+            _ => None,
+        };
+        let Some(target) = drag_target else {
+            return false;
+        };
+        self.scrollbar_dragging = Some(target);
+        match target {
+            ScrollbarDrag::Viewer => {
+                self.focus = Focus::Viewer;
+                self.scroll =
+                    scrollbar_position_from_row(self.viewer_area, mouse.row, self.max_scroll());
+            }
+            ScrollbarDrag::Python => {
+                self.focus = Focus::Python;
+                let Mode::Python(pane) = &mut self.mode else {
+                    return false;
+                };
+                let top_position =
+                    scrollbar_position_from_row(self.python_area, mouse.row, pane.max_scroll());
+                pane.scroll = pane.max_scroll().saturating_sub(top_position);
+            }
+        }
+        true
     }
 
     fn byte_at(&self, column: u16, row: u16) -> Option<usize> {
@@ -2227,6 +2309,51 @@ fn calculate_entropy(bytes: &[u8]) -> Vec<f64> {
         .collect()
 }
 
+fn navigate_python_history(pane: &mut PythonPane, older: bool) {
+    if pane.history.is_empty() {
+        return;
+    }
+    if older {
+        let index = match pane.history_index {
+            Some(index) => index.saturating_sub(1),
+            None => {
+                pane.history_draft = pane.input.value.clone();
+                pane.history.len() - 1
+            }
+        };
+        pane.history_index = Some(index);
+        pane.input.value = pane.history[index].clone();
+    } else {
+        let Some(index) = pane.history_index else {
+            return;
+        };
+        if index + 1 < pane.history.len() {
+            let next = index + 1;
+            pane.history_index = Some(next);
+            pane.input.value = pane.history[next].clone();
+        } else {
+            pane.history_index = None;
+            pane.input.value = std::mem::take(&mut pane.history_draft);
+        }
+    }
+}
+
+fn is_scrollbar_column(area: Rect, column: u16) -> bool {
+    area.width >= 2 && area.right().checked_sub(1) == Some(column)
+}
+
+fn scrollbar_position_from_row(area: Rect, row: u16, max_position: usize) -> usize {
+    if max_position == 0 || area.height < 3 {
+        return 0;
+    }
+    let top = area.y.saturating_add(1);
+    let bottom = area.bottom().saturating_sub(2);
+    let row = row.clamp(top, bottom);
+    let offset = usize::from(row.saturating_sub(top));
+    let track = usize::from(bottom.saturating_sub(top)).max(1);
+    offset.saturating_mul(max_position) / track
+}
+
 pub fn parse_offset(input: &str) -> Result<usize, String> {
     let input = input.trim().replace('_', "");
     if input.is_empty() {
@@ -2465,6 +2592,34 @@ mod tests {
                 modifiers: KeyModifiers::NONE,
             });
         }
+    }
+
+    #[test]
+    fn scrollbar_rows_map_to_the_full_scroll_range() {
+        let area = Rect::new(10, 5, 40, 12);
+        assert_eq!(scrollbar_position_from_row(area, 6, 100), 0);
+        assert_eq!(scrollbar_position_from_row(area, 15, 100), 100);
+        assert_eq!(scrollbar_position_from_row(area, 10, 100), 44);
+    }
+
+    #[test]
+    fn python_history_restores_the_unfinished_draft() {
+        let mut app = App::new("sample.bin".into(), vec![0]);
+        app.open_python_pane();
+        let Mode::Python(pane) = &mut app.mode else {
+            return;
+        };
+        pane.history = vec!["first".into(), "second".into()];
+        pane.input.value = "unfinished".into();
+
+        navigate_python_history(pane, true);
+        assert_eq!(pane.input.value, "second");
+        navigate_python_history(pane, true);
+        assert_eq!(pane.input.value, "first");
+        navigate_python_history(pane, false);
+        assert_eq!(pane.input.value, "second");
+        navigate_python_history(pane, false);
+        assert_eq!(pane.input.value, "unfinished");
     }
 
     #[test]

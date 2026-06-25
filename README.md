@@ -24,6 +24,7 @@ side-by-side diffs, customizable themes, and entropy visualization.
 - Optional compression of long runs of uniform byte rows
 - Persistent Python analysis console with a mutable byte-buffer snapshot
 - Position-aware vertical scrollbars for the hex viewer and Python console
+- Clickable and draggable scrollbars plus Python command history
 
 ## Requirements
 
@@ -304,7 +305,9 @@ close it. Page Up/Page Down and the mouse wheel scroll output history;
 `Ctrl+Home` and `Ctrl+End` jump to the oldest and newest output. Tab and
 Shift+Tab cycle focus between the hex viewer, fields pane, and Python console
 without ending the interpreter session. A vertical scrollbar tracks the
-currently visible section of the interpreter history.
+currently visible section of the interpreter history. Click or drag either
+pane's scrollbar to jump through its content. Up and Down recall Python
+commands, restoring unfinished input after moving past the newest command.
 
 The console executes code with the same operating-system permissions as
 rexedit, so only run Python code you trust.
