@@ -23,6 +23,8 @@ side-by-side diffs, customizable themes, and entropy visualization.
 - Configurable 16- or 32-byte rows, casing, offsets, ASCII, and side panes
 - Optional compression of long runs of uniform byte rows
 - Persistent Python analysis console with a mutable byte-buffer snapshot
+- Position-aware vertical scrollbars for the hex viewer and Python console
+- Clickable and draggable scrollbars plus Python command history
 
 ## Requirements
 
@@ -140,6 +142,12 @@ Open one binary:
 
 ```bash
 rexedit firmware.bin
+```
+
+Launch without a file and open one later with `Ctrl+N`:
+
+```bash
+rexedit
 ```
 
 Open several binaries in one workspace:
@@ -287,13 +295,28 @@ The console provides:
 - `selected`, a view of the selection that was active when the pane opened;
 - `selection_start` and `selection_end`;
 - preloaded `struct`, `binascii`, `hashlib`, `base64`, `zlib`, `math`, `re`,
-  and `pathlib` modules.
+  `signal`, and `pathlib` modules.
 
 Expressions print their result and variables persist between commands. Enter
 `:apply` to copy same-length changes from `buffer` back into rexedit. Length
 changes are rejected because the editor currently supports byte overwrite,
 not insertion or deletion. Press `Ctrl+L` to clear the pane and Escape to
-close it.
+close it. Page Up/Page Down and the mouse wheel scroll output history;
+`Ctrl+Home` and `Ctrl+End` jump to the oldest and newest output. Tab and
+Shift+Tab cycle focus between the hex viewer, fields pane, and Python console
+without ending the interpreter session. A vertical scrollbar tracks the
+currently visible section of the interpreter history. Click or drag either
+pane's scrollbar to jump through its content. Up and Down recall Python
+commands, restoring unfinished input after moving past the newest command.
+Command history survives closing and reopening the pane until rexedit exits.
+`Ctrl+C` interrupts the currently running Python command without terminating
+rexedit.
+
+This keybinding is safe on both supported terminal families. Crossterm raw mode
+delivers `Ctrl+C` to rexedit as keyboard input instead of terminating the
+application. Rexedit forwards `SIGINT` to Python on Unix; on Windows, Python is
+placed in its own process group and receives a console break event mapped to
+`KeyboardInterrupt`.
 
 The console executes code with the same operating-system permissions as
 rexedit, so only run Python code you trust.

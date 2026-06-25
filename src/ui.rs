@@ -1,9 +1,12 @@
 use ratatui::{
     Frame,
-    layout::{Constraint, Layout, Rect},
+    layout::{Constraint, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, Paragraph, Sparkline, Wrap},
+    widgets::{
+        Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+        Sparkline, Wrap,
+    },
 };
 
 use crate::app::{
@@ -15,6 +18,12 @@ pub fn render_workspace(frame: &mut Frame, workspace: &mut Workspace) {
     let [tabs, content] =
         Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(frame.area());
     render_tabs(frame, workspace, tabs);
+
+    if workspace.documents.is_empty() {
+        workspace.comparison_panes.clear();
+        render_empty_workspace(frame, workspace, content);
+        return;
+    }
 
     let content = if workspace.show_entropy {
         let [main, entropy] =
@@ -34,6 +43,34 @@ pub fn render_workspace(frame: &mut Frame, workspace: &mut Workspace) {
         let active = workspace.active;
         render_in(frame, &mut workspace.documents[active], content);
     }
+}
+
+fn render_empty_workspace(frame: &mut Frame, workspace: &Workspace, area: Rect) {
+    let area = centered_rect(area, 72, 11);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(""),
+            Line::styled(
+                "No binary is open",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Line::from(""),
+            Line::from("Press Ctrl+N to choose a binary with the system file picker."),
+            Line::from(""),
+            Line::styled("q quits", Style::default().fg(Color::DarkGray)),
+            Line::from(""),
+            Line::styled(&workspace.status, Style::default().fg(Color::Yellow)),
+        ])
+        .block(
+            Block::default()
+                .title(" rexedit ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+        ),
+        area,
+    );
 }
 
 fn render_in(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -58,8 +95,13 @@ fn render_in(frame: &mut Frame, app: &mut App, area: Rect) {
 
     app.viewer_area = viewer;
     app.fields_area = fields;
+    app.python_area = python_area.unwrap_or_default();
     app.visible_rows = viewer.height.saturating_sub(2) as usize;
     app.scroll = app.scroll.min(app.max_scroll());
+    if let Mode::Python(pane) = &mut app.mode {
+        pane.visible_output_lines = app.python_area.height.saturating_sub(4) as usize;
+        pane.clamp_scroll();
+    }
 
     render_viewer(frame, app, viewer, None, None);
     if app.settings.show_sidebar {
@@ -67,7 +109,7 @@ fn render_in(frame: &mut Frame, app: &mut App, area: Rect) {
         render_inspector(frame, app, inspector);
     }
     if let (Some(area), Mode::Python(pane)) = (python_area, &app.mode) {
-        render_python_pane(frame, pane, area);
+        render_python_pane(frame, pane, area, app.focus == Focus::Python);
     }
     render_status(frame, app, status);
 
@@ -377,6 +419,14 @@ fn render_viewer(
                 .border_style(viewer_border_style(app)),
         ),
         area,
+    );
+    render_vertical_scrollbar(
+        frame,
+        area,
+        app.row_count(),
+        app.visible_rows,
+        app.scroll,
+        app.theme.hex_secondary.color(),
     );
 }
 
@@ -907,10 +957,10 @@ fn render_reset_confirmation(frame: &mut Frame, target: ResetTarget) {
     );
 }
 
-fn render_python_pane(frame: &mut Frame, pane: &PythonPane, area: Rect) {
+fn render_python_pane(frame: &mut Frame, pane: &PythonPane, area: Rect, active: bool) {
     let output_height = area.height.saturating_sub(4) as usize;
-    let start = pane.output.len().saturating_sub(output_height);
-    let mut lines = pane.output[start..]
+    let (start, end) = python_output_range(pane.output.len(), output_height, pane.scroll);
+    let mut lines = pane.output[start..end]
         .iter()
         .map(|line| Line::raw(line.clone()))
         .collect::<Vec<_>>();
@@ -931,15 +981,79 @@ fn render_python_pane(frame: &mut Frame, pane: &PythonPane, area: Rect) {
         Paragraph::new(lines).wrap(Wrap { trim: false }).block(
             Block::default()
                 .title(Span::styled(
-                    " Python buffer console — Enter run | :apply sync | Ctrl+L clear | Esc close ",
-                    Style::default()
-                        .fg(Color::LightGreen)
-                        .add_modifier(Modifier::BOLD),
+                    " Python console — ↑/↓ history | Ctrl+C interrupt | Tab pane | Enter run | Esc close ",
+                    if active {
+                        Style::default()
+                            .fg(Color::LightGreen)
+                            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                    } else {
+                        Style::default()
+                            .fg(Color::Green)
+                            .add_modifier(Modifier::BOLD)
+                    },
                 ))
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Green)),
+                .border_style(Style::default().fg(if active {
+                    Color::LightGreen
+                } else {
+                    Color::Green
+                })),
         ),
         area,
+    );
+    render_vertical_scrollbar(
+        frame,
+        area,
+        pane.output.len(),
+        pane.visible_output_lines,
+        python_scrollbar_position(pane.output.len(), pane.visible_output_lines, pane.scroll),
+        if active {
+            Color::LightGreen
+        } else {
+            Color::Green
+        },
+    );
+}
+
+fn python_output_range(length: usize, height: usize, scroll: usize) -> (usize, usize) {
+    let max_scroll = length.saturating_sub(height);
+    let end = length.saturating_sub(scroll.min(max_scroll));
+    (end.saturating_sub(height), end)
+}
+
+fn python_scrollbar_position(length: usize, viewport_length: usize, scroll: usize) -> usize {
+    length
+        .saturating_sub(viewport_length)
+        .saturating_sub(scroll)
+}
+
+fn render_vertical_scrollbar(
+    frame: &mut Frame,
+    area: Rect,
+    content_length: usize,
+    viewport_length: usize,
+    position: usize,
+    color: Color,
+) {
+    if content_length <= viewport_length || area.width < 2 || area.height < 3 {
+        return;
+    }
+    let mut state = ScrollbarState::new(content_length)
+        .position(position)
+        .viewport_content_length(viewport_length);
+    let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+        .begin_symbol(Some("↑"))
+        .end_symbol(Some("↓"))
+        .track_symbol(Some("│"))
+        .thumb_symbol("█")
+        .style(Style::default().fg(color));
+    frame.render_stateful_widget(
+        scrollbar,
+        area.inner(Margin {
+            vertical: 1,
+            horizontal: 0,
+        }),
+        &mut state,
     );
 }
 
@@ -1049,7 +1163,12 @@ fn keybinding_lines() -> Vec<Line<'static>> {
         Line::from(""),
         section("Python console"),
         binding("Enter", "execute an expression or statement"),
+        binding("Up / Down", "previous / next Python command"),
+        binding("Ctrl+C", "interrupt the running Python command"),
+        binding("Tab / Shift+Tab", "cycle viewer, fields, and Python panes"),
         binding(":apply", "copy same-length buffer edits into rexedit"),
+        binding("PgUp/PgDn / wheel", "scroll console output"),
+        binding("Ctrl+Home / Ctrl+End", "oldest / newest console output"),
         binding("Ctrl+L", "clear console output"),
         binding("Escape", "close the Python pane"),
         Line::from(""),
@@ -1174,6 +1293,20 @@ mod tests {
     }
 
     #[test]
+    fn python_output_range_scrolls_back_through_history() {
+        assert_eq!(python_output_range(100, 20, 0), (80, 100));
+        assert_eq!(python_output_range(100, 20, 10), (70, 90));
+        assert_eq!(python_output_range(8, 20, usize::MAX), (0, 8));
+        assert_eq!(python_output_range(100, 20, usize::MAX), (0, 20));
+    }
+
+    #[test]
+    fn python_scrollbar_position_uses_top_based_coordinates() {
+        assert_eq!(python_scrollbar_position(100, 20, 0), 80);
+        assert_eq!(python_scrollbar_position(100, 20, 80), 0);
+    }
+
+    #[test]
     fn renders_the_complete_workspace() {
         let backend = TestBackend::new(130, 36);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -1194,6 +1327,28 @@ mod tests {
         assert!(rendered.contains("Hex Viewer - View Mode"));
         assert!(rendered.contains("Inspector"));
         assert!(rendered.contains("Fields"));
+    }
+
+    #[test]
+    fn renders_empty_workspace_file_opening_prompt() {
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut workspace = Workspace::new(Vec::new());
+        terminal
+            .draw(|frame| render_workspace(frame, &mut workspace))
+            .unwrap();
+        let rendered =
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .fold(String::new(), |mut output, cell| {
+                    output.push_str(cell.symbol());
+                    output
+                });
+        assert!(rendered.contains("No binary is open"));
+        assert!(rendered.contains("Ctrl+N"));
     }
 
     #[test]

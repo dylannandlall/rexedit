@@ -34,6 +34,13 @@ pub enum Focus {
     #[default]
     Viewer,
     Fields,
+    Python,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScrollbarDrag {
+    Viewer,
+    Python,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -179,6 +186,21 @@ pub struct PythonPane {
     pub output: Vec<String>,
     pub session: PythonSession,
     pub pending: usize,
+    pub scroll: usize,
+    pub visible_output_lines: usize,
+    pub history: Vec<String>,
+    pub history_index: Option<usize>,
+    pub history_draft: String,
+}
+
+impl PythonPane {
+    pub fn max_scroll(&self) -> usize {
+        self.output.len().saturating_sub(self.visible_output_lines)
+    }
+
+    pub(crate) fn clamp_scroll(&mut self) {
+        self.scroll = self.scroll.min(self.max_scroll());
+    }
 }
 
 #[derive(Debug, Default)]
@@ -281,9 +303,11 @@ pub struct App {
     pub status: String,
     pub viewer_area: Rect,
     pub fields_area: Rect,
+    pub python_area: Rect,
     pub theme: Theme,
     pub settings: ViewerSettings,
     pub display_rows: Vec<DisplayRow>,
+    python_history: Vec<String>,
     pub edit_mode: bool,
     pub edit_high_nibble: bool,
     pub modified_offsets: BTreeSet<usize>,
@@ -291,6 +315,7 @@ pub struct App {
     redo_stack: Vec<EditAction>,
     pending_edit: Option<PendingEdit>,
     mouse_dragging: bool,
+    scrollbar_dragging: Option<ScrollbarDrag>,
     quit_armed: bool,
     pub entropy: Option<Vec<f64>>,
 }
@@ -313,9 +338,11 @@ impl App {
             status: "Ready".into(),
             viewer_area: Rect::default(),
             fields_area: Rect::default(),
+            python_area: Rect::default(),
             theme: Theme::default(),
             settings: ViewerSettings::default(),
             display_rows: Vec::new(),
+            python_history: Vec::new(),
             edit_mode: false,
             edit_high_nibble: true,
             modified_offsets: BTreeSet::new(),
@@ -323,6 +350,7 @@ impl App {
             redo_stack: Vec::new(),
             pending_edit: None,
             mouse_dragging: false,
+            scrollbar_dragging: None,
             quit_armed: false,
             entropy: None,
         };
@@ -413,6 +441,17 @@ impl Workspace {
     }
 
     fn handle_workspace_key(&mut self, key: KeyEvent) -> io::Result<bool> {
+        if self.documents.is_empty() {
+            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('n') {
+                self.open_binary_picker();
+                return Ok(false);
+            }
+            if key.code == KeyCode::Char('q') {
+                return Ok(true);
+            }
+            self.status = "No binary open — Ctrl+N opens a file; q quits".into();
+            return Ok(false);
+        }
         if self.tab_switch_pending {
             self.tab_switch_pending = false;
             match key.code {
@@ -467,6 +506,9 @@ impl Workspace {
     }
 
     pub(crate) fn handle_workspace_mouse(&mut self, mouse: MouseEvent) {
+        if self.documents.is_empty() {
+            return;
+        }
         if mouse.row == self.tab_row
             && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
             && let Some(index) = self
@@ -541,13 +583,17 @@ impl Workspace {
                 Err(error) => {
                     let message = format!("Could not open {}: {error}", path.display());
                     self.status = message.clone();
-                    self.active_mut().status = message;
+                    if let Some(document) = self.documents.get_mut(self.active) {
+                        document.status = message;
+                    }
                 }
             },
             Ok(None) => self.status = "Open cancelled".into(),
             Err(error) => {
                 self.status = error.clone();
-                self.active_mut().status = error;
+                if let Some(document) = self.documents.get_mut(self.active) {
+                    document.status = error;
+                }
             }
         }
     }
@@ -776,7 +822,7 @@ impl App {
             KeyCode::Tab => {
                 self.focus = match self.focus {
                     Focus::Viewer => Focus::Fields,
-                    Focus::Fields => Focus::Viewer,
+                    Focus::Fields | Focus::Python => Focus::Viewer,
                 };
             }
             KeyCode::Char('a') => {
@@ -1127,7 +1173,13 @@ impl App {
                     ],
                     session,
                     pending: 0,
+                    scroll: 0,
+                    visible_output_lines: 1,
+                    history: self.python_history.clone(),
+                    history_index: None,
+                    history_draft: String::new(),
                 });
+                self.focus = Focus::Python;
                 self.status = "Python pane opened".into();
             }
             Err(error) => self.status = error,
@@ -1136,15 +1188,83 @@ impl App {
 
     fn handle_python_key(&mut self, key: KeyEvent) {
         if key.code == KeyCode::Esc {
+            if let Mode::Python(pane) = &self.mode {
+                self.python_history = pane.history.clone();
+            }
             self.mode = Mode::Normal;
+            self.focus = Focus::Viewer;
             self.status = "Python pane closed".into();
+            return;
+        }
+        if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+            self.cycle_python_focus(key.code == KeyCode::Tab);
+            return;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            let result = match &self.mode {
+                Mode::Python(pane) if pane.pending > 0 => pane.session.interrupt(),
+                Mode::Python(_) => {
+                    self.status = "No Python command is currently running".into();
+                    return;
+                }
+                _ => return,
+            };
+            self.status = match result {
+                Ok(()) => "Interrupt sent to Python".into(),
+                Err(error) => error,
+            };
+            return;
+        }
+        if self.focus != Focus::Python {
+            self.handle_python_content_key(key);
             return;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('l') {
             if let Mode::Python(pane) = &mut self.mode {
                 pane.output.clear();
+                pane.scroll = 0;
             }
             return;
+        }
+        match key.code {
+            KeyCode::Up => {
+                if let Mode::Python(pane) = &mut self.mode {
+                    navigate_python_history(pane, true);
+                }
+                return;
+            }
+            KeyCode::Down => {
+                if let Mode::Python(pane) = &mut self.mode {
+                    navigate_python_history(pane, false);
+                }
+                return;
+            }
+            KeyCode::PageUp => {
+                if let Mode::Python(pane) = &mut self.mode {
+                    pane.scroll = pane.scroll.saturating_add(10);
+                    pane.clamp_scroll();
+                }
+                return;
+            }
+            KeyCode::PageDown => {
+                if let Mode::Python(pane) = &mut self.mode {
+                    pane.scroll = pane.scroll.saturating_sub(10);
+                }
+                return;
+            }
+            KeyCode::Home if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Mode::Python(pane) = &mut self.mode {
+                    pane.scroll = pane.max_scroll();
+                }
+                return;
+            }
+            KeyCode::End if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Mode::Python(pane) = &mut self.mode {
+                    pane.scroll = 0;
+                }
+                return;
+            }
+            _ => {}
         }
         if key.code == KeyCode::Enter {
             let command = match &mut self.mode {
@@ -1156,6 +1276,13 @@ impl App {
             }
             let result = if let Mode::Python(pane) = &mut self.mode {
                 pane.output.push(format!(">>> {command}"));
+                pane.scroll = 0;
+                if pane.history.last() != Some(&command) {
+                    pane.history.push(command.clone());
+                }
+                self.python_history = pane.history.clone();
+                pane.history_index = None;
+                pane.history_draft.clear();
                 let result = if command.trim() == ":apply" {
                     pane.session.apply()
                 } else {
@@ -1175,6 +1302,68 @@ impl App {
         }
         if let Mode::Python(pane) = &mut self.mode {
             pane.input.handle_key(key);
+            pane.history_index = None;
+            pane.history_draft.clear();
+        }
+    }
+
+    fn cycle_python_focus(&mut self, forward: bool) {
+        self.focus = match (self.focus, self.settings.show_sidebar, forward) {
+            (Focus::Viewer, true, true) => Focus::Fields,
+            (Focus::Viewer, false, true) => Focus::Python,
+            (Focus::Fields, _, true) => Focus::Python,
+            (Focus::Python, _, true) => Focus::Viewer,
+            (Focus::Viewer, _, false) => Focus::Python,
+            (Focus::Fields, _, false) => Focus::Viewer,
+            (Focus::Python, true, false) => Focus::Fields,
+            (Focus::Python, false, false) => Focus::Viewer,
+        };
+        self.status = match self.focus {
+            Focus::Viewer => "Python mode: hex viewer focused".into(),
+            Focus::Fields => "Python mode: fields pane focused".into(),
+            Focus::Python => "Python mode: console focused".into(),
+        };
+    }
+
+    fn handle_python_content_key(&mut self, key: KeyEvent) {
+        match (self.focus, key.code) {
+            (Focus::Viewer, KeyCode::Left) => {
+                self.move_cursor(-1, key.modifiers.contains(KeyModifiers::SHIFT));
+            }
+            (Focus::Viewer, KeyCode::Right) => {
+                self.move_cursor(1, key.modifiers.contains(KeyModifiers::SHIFT));
+            }
+            (Focus::Viewer, KeyCode::Up) => self.move_cursor(
+                -(self.settings.bytes_per_row as isize),
+                key.modifiers.contains(KeyModifiers::SHIFT),
+            ),
+            (Focus::Viewer, KeyCode::Down) => self.move_cursor(
+                self.settings.bytes_per_row as isize,
+                key.modifiers.contains(KeyModifiers::SHIFT),
+            ),
+            (Focus::Viewer, KeyCode::PageUp) => self.move_cursor(
+                -(self
+                    .visible_rows
+                    .saturating_mul(self.settings.bytes_per_row) as isize),
+                key.modifiers.contains(KeyModifiers::SHIFT),
+            ),
+            (Focus::Viewer, KeyCode::PageDown) => self.move_cursor(
+                self.visible_rows
+                    .saturating_mul(self.settings.bytes_per_row) as isize,
+                key.modifiers.contains(KeyModifiers::SHIFT),
+            ),
+            (Focus::Viewer, KeyCode::Home) => {
+                self.select_offset(0, key.modifiers.contains(KeyModifiers::SHIFT));
+            }
+            (Focus::Viewer, KeyCode::End) if !self.bytes.is_empty() => {
+                self.select_offset(
+                    self.bytes.len() - 1,
+                    key.modifiers.contains(KeyModifiers::SHIFT),
+                );
+            }
+            (Focus::Fields, KeyCode::Up | KeyCode::Char('[')) => self.select_previous_field(),
+            (Focus::Fields, KeyCode::Down | KeyCode::Char(']')) => self.select_next_field(),
+            _ => {}
         }
     }
 
@@ -1194,6 +1383,7 @@ impl App {
                     if let Some(error) = response.error {
                         pane.output.push(error);
                     }
+                    pane.scroll = 0;
                     response.applied.then(|| pane.session.snapshot.clone())
                 }
                 _ => None,
@@ -1265,9 +1455,46 @@ impl App {
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) {
+        if self.handle_scrollbar_mouse(mouse) {
+            return;
+        }
+        if matches!(self.mode, Mode::Python(_))
+            && self.python_area.contains((mouse.column, mouse.row).into())
+        {
+            self.focus = Focus::Python;
+            let Mode::Python(pane) = &mut self.mode else {
+                return;
+            };
+            match mouse.kind {
+                MouseEventKind::ScrollUp => {
+                    pane.scroll = pane.scroll.saturating_add(3);
+                    pane.clamp_scroll();
+                }
+                MouseEventKind::ScrollDown => {
+                    pane.scroll = pane.scroll.saturating_sub(3);
+                }
+                _ => {}
+            }
+            return;
+        }
+        if matches!(self.mode, Mode::Python(_)) {
+            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                if self.viewer_area.contains((mouse.column, mouse.row).into()) {
+                    self.focus = Focus::Viewer;
+                } else if self.fields_area.contains((mouse.column, mouse.row).into()) {
+                    self.focus = Focus::Fields;
+                }
+            }
+            self.handle_content_mouse(mouse);
+            return;
+        }
         if !matches!(self.mode, Mode::Normal) {
             return;
         }
+        self.handle_content_mouse(mouse);
+    }
+
+    fn handle_content_mouse(&mut self, mouse: MouseEvent) {
         match mouse.kind {
             MouseEventKind::ScrollUp => self.scroll = self.scroll.saturating_sub(3),
             MouseEventKind::ScrollDown => {
@@ -1300,6 +1527,52 @@ impl App {
             MouseEventKind::Up(MouseButton::Left) => self.mouse_dragging = false,
             _ => {}
         }
+    }
+
+    fn handle_scrollbar_mouse(&mut self, mouse: MouseEvent) -> bool {
+        let drag_target = match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if is_scrollbar_column(self.python_area, mouse.column)
+                    && self.python_area.contains((mouse.column, mouse.row).into())
+                    && matches!(self.mode, Mode::Python(_))
+                {
+                    Some(ScrollbarDrag::Python)
+                } else if is_scrollbar_column(self.viewer_area, mouse.column)
+                    && self.viewer_area.contains((mouse.column, mouse.row).into())
+                {
+                    Some(ScrollbarDrag::Viewer)
+                } else {
+                    None
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => self.scrollbar_dragging,
+            MouseEventKind::Up(MouseButton::Left) => {
+                let was_dragging = self.scrollbar_dragging.take().is_some();
+                return was_dragging;
+            }
+            _ => None,
+        };
+        let Some(target) = drag_target else {
+            return false;
+        };
+        self.scrollbar_dragging = Some(target);
+        match target {
+            ScrollbarDrag::Viewer => {
+                self.focus = Focus::Viewer;
+                self.scroll =
+                    scrollbar_position_from_row(self.viewer_area, mouse.row, self.max_scroll());
+            }
+            ScrollbarDrag::Python => {
+                self.focus = Focus::Python;
+                let Mode::Python(pane) = &mut self.mode else {
+                    return false;
+                };
+                let top_position =
+                    scrollbar_position_from_row(self.python_area, mouse.row, pane.max_scroll());
+                pane.scroll = pane.max_scroll().saturating_sub(top_position);
+            }
+        }
+        true
     }
 
     fn byte_at(&self, column: u16, row: u16) -> Option<usize> {
@@ -2057,6 +2330,51 @@ fn calculate_entropy(bytes: &[u8]) -> Vec<f64> {
         .collect()
 }
 
+fn navigate_python_history(pane: &mut PythonPane, older: bool) {
+    if pane.history.is_empty() {
+        return;
+    }
+    if older {
+        let index = match pane.history_index {
+            Some(index) => index.saturating_sub(1),
+            None => {
+                pane.history_draft = pane.input.value.clone();
+                pane.history.len() - 1
+            }
+        };
+        pane.history_index = Some(index);
+        pane.input.value = pane.history[index].clone();
+    } else {
+        let Some(index) = pane.history_index else {
+            return;
+        };
+        if index + 1 < pane.history.len() {
+            let next = index + 1;
+            pane.history_index = Some(next);
+            pane.input.value = pane.history[next].clone();
+        } else {
+            pane.history_index = None;
+            pane.input.value = std::mem::take(&mut pane.history_draft);
+        }
+    }
+}
+
+fn is_scrollbar_column(area: Rect, column: u16) -> bool {
+    area.width >= 2 && area.right().checked_sub(1) == Some(column)
+}
+
+fn scrollbar_position_from_row(area: Rect, row: u16, max_position: usize) -> usize {
+    if max_position == 0 || area.height < 3 {
+        return 0;
+    }
+    let top = area.y.saturating_add(1);
+    let bottom = area.bottom().saturating_sub(2);
+    let row = row.clamp(top, bottom);
+    let offset = usize::from(row.saturating_sub(top));
+    let track = usize::from(bottom.saturating_sub(top)).max(1);
+    offset.saturating_mul(max_position) / track
+}
+
 pub fn parse_offset(input: &str) -> Result<usize, String> {
     let input = input.trim().replace('_', "");
     if input.is_empty() {
@@ -2228,6 +2546,23 @@ mod tests {
     }
 
     #[test]
+    fn empty_workspace_can_wait_for_a_file_or_quit() {
+        let mut workspace = Workspace::new(Vec::new());
+        assert!(
+            workspace
+                .handle_workspace_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
+                .unwrap()
+        );
+
+        assert!(
+            !workspace
+                .handle_workspace_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))
+                .unwrap()
+        );
+        assert!(workspace.status.contains("Ctrl+N"));
+    }
+
+    #[test]
     fn workspace_chord_toggles_comparison_and_disables_diff() {
         let mut workspace = Workspace::new(vec![
             App::new("one.bin".into(), vec![1]),
@@ -2278,6 +2613,53 @@ mod tests {
                 modifiers: KeyModifiers::NONE,
             });
         }
+    }
+
+    #[test]
+    fn scrollbar_rows_map_to_the_full_scroll_range() {
+        let area = Rect::new(10, 5, 40, 12);
+        assert_eq!(scrollbar_position_from_row(area, 6, 100), 0);
+        assert_eq!(scrollbar_position_from_row(area, 15, 100), 100);
+        assert_eq!(scrollbar_position_from_row(area, 10, 100), 44);
+    }
+
+    #[test]
+    fn python_history_restores_the_unfinished_draft() {
+        let mut app = App::new("sample.bin".into(), vec![0]);
+        app.open_python_pane();
+        let Mode::Python(pane) = &mut app.mode else {
+            return;
+        };
+        pane.history = vec!["first".into(), "second".into()];
+        pane.input.value = "unfinished".into();
+
+        navigate_python_history(pane, true);
+        assert_eq!(pane.input.value, "second");
+        navigate_python_history(pane, true);
+        assert_eq!(pane.input.value, "first");
+        navigate_python_history(pane, false);
+        assert_eq!(pane.input.value, "second");
+        navigate_python_history(pane, false);
+        assert_eq!(pane.input.value, "unfinished");
+    }
+
+    #[test]
+    fn python_history_survives_closing_and_reopening_the_pane() {
+        let mut app = App::new("sample.bin".into(), vec![0]);
+        app.open_python_pane();
+        let Mode::Python(pane) = &mut app.mode else {
+            panic!("Python should open");
+        };
+        pane.history = vec!["first".into(), "second".into()];
+
+        app.handle_python_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.python_history, ["first", "second"]);
+
+        app.open_python_pane();
+        let Mode::Python(pane) = &app.mode else {
+            panic!("Python should reopen");
+        };
+        assert_eq!(pane.history, ["first", "second"]);
     }
 
     #[test]

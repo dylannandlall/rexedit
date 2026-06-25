@@ -16,6 +16,11 @@ use serde::{Deserialize, Serialize};
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
+#[cfg(windows)]
+use windows_sys::Win32::System::{
+    Console::{CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent},
+    Threading::CREATE_NEW_PROCESS_GROUP,
+};
 
 const BRIDGE: &str = r#"
 import ast
@@ -27,6 +32,7 @@ import json
 import math
 import pathlib
 import re
+import signal
 import struct
 import sys
 import zlib
@@ -37,6 +43,8 @@ selection_start = int(sys.argv[2])
 selection_end = int(sys.argv[3])
 buffer = bytearray(snapshot.read_bytes())
 selected = memoryview(buffer)[selection_start:selection_end + 1]
+if hasattr(signal, "SIGBREAK"):
+    signal.signal(signal.SIGBREAK, signal.default_int_handler)
 
 namespace = {
     "ast": ast,
@@ -47,6 +55,7 @@ namespace = {
     "math": math,
     "pathlib": pathlib,
     "re": re,
+    "signal": signal,
     "selected": selected,
     "selection_start": selection_start,
     "selection_end": selection_end,
@@ -168,6 +177,13 @@ impl PythonSession {
             .send(PythonCommand::Apply)
             .map_err(|_| "Python interpreter is no longer running".into())
     }
+
+    pub fn interrupt(&self) -> Result<(), String> {
+        if !self.process_running.load(Ordering::Acquire) {
+            return Err("Python interpreter is no longer running".into());
+        }
+        interrupt_process(self.process_id)
+    }
 }
 
 impl Drop for PythonSession {
@@ -213,7 +229,8 @@ fn spawn_python(
     selection_start: usize,
     selection_end: usize,
 ) -> Result<Child, String> {
-    Command::new(executable)
+    let mut command = Command::new(executable);
+    command
         .args([
             "-u",
             "-c",
@@ -224,9 +241,40 @@ fn spawn_python(
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NEW_PROCESS_GROUP);
+    command
         .spawn()
         .map_err(|error| format!("Could not start Python: {error}"))
+}
+
+#[cfg(unix)]
+fn interrupt_process(process_id: u32) -> Result<(), String> {
+    // SAFETY: SIGINT is sent to the known live Python child process.
+    let result = unsafe { libc::kill(process_id as i32, libc::SIGINT) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "Could not interrupt Python: {}",
+            std::io::Error::last_os_error()
+        ))
+    }
+}
+
+#[cfg(windows)]
+fn interrupt_process(process_id: u32) -> Result<(), String> {
+    // SAFETY: The Python child is created as its own process group, and this targets that group.
+    let result = unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, process_id) };
+    if result != 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "Could not interrupt Python: {}",
+            std::io::Error::last_os_error()
+        ))
+    }
 }
 
 fn exchange_commands(
@@ -334,5 +382,21 @@ mod tests {
             .unwrap();
         assert!(response.applied);
         assert_eq!(fs::read(&session.snapshot).unwrap(), [255, 2, 3]);
+    }
+
+    #[test]
+    fn interrupts_a_running_python_command() {
+        if find_python().is_none() {
+            return;
+        }
+        let session = PythonSession::start(&[0], 0, 0).unwrap();
+        session.execute("while True: pass".into()).unwrap();
+        thread::sleep(Duration::from_millis(100));
+        session.interrupt().unwrap();
+        let response = session
+            .responses
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(response.error.as_deref(), Some("KeyboardInterrupt: "));
     }
 }
