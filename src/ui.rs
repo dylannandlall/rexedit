@@ -1,9 +1,12 @@
 use ratatui::{
     Frame,
-    layout::{Constraint, Layout, Rect},
+    layout::{Constraint, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, Paragraph, Sparkline, Wrap},
+    widgets::{
+        Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+        Sparkline, Wrap,
+    },
 };
 
 use crate::app::{
@@ -416,6 +419,14 @@ fn render_viewer(
                 .border_style(viewer_border_style(app)),
         ),
         area,
+    );
+    render_vertical_scrollbar(
+        frame,
+        area,
+        app.row_count(),
+        app.visible_rows,
+        app.scroll,
+        app.theme.hex_secondary.color(),
     );
 }
 
@@ -990,12 +1001,60 @@ fn render_python_pane(frame: &mut Frame, pane: &PythonPane, area: Rect, active: 
         ),
         area,
     );
+    render_vertical_scrollbar(
+        frame,
+        area,
+        pane.output.len(),
+        pane.visible_output_lines,
+        python_scrollbar_position(pane.output.len(), pane.visible_output_lines, pane.scroll),
+        if active {
+            Color::LightGreen
+        } else {
+            Color::Green
+        },
+    );
 }
 
 fn python_output_range(length: usize, height: usize, scroll: usize) -> (usize, usize) {
     let max_scroll = length.saturating_sub(height);
     let end = length.saturating_sub(scroll.min(max_scroll));
     (end.saturating_sub(height), end)
+}
+
+fn python_scrollbar_position(length: usize, viewport_length: usize, scroll: usize) -> usize {
+    length
+        .saturating_sub(viewport_length)
+        .saturating_sub(scroll)
+}
+
+fn render_vertical_scrollbar(
+    frame: &mut Frame,
+    area: Rect,
+    content_length: usize,
+    viewport_length: usize,
+    position: usize,
+    color: Color,
+) {
+    if content_length <= viewport_length || area.width < 2 || area.height < 3 {
+        return;
+    }
+    let mut state = ScrollbarState::new(content_length)
+        .position(position)
+        .viewport_content_length(viewport_length);
+    let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+        .begin_symbol(Some("↑"))
+        .end_symbol(Some("↓"))
+        .track_symbol(Some("│"))
+        .thumb_symbol("█")
+        .style(Style::default().fg(color));
+    frame.render_stateful_widget(
+        scrollbar,
+        area.inner(Margin {
+            vertical: 1,
+            horizontal: 0,
+        }),
+        &mut state,
+    );
 }
 
 fn render_help_modal(frame: &mut Frame, help: &HelpViewer) {
@@ -1237,6 +1296,12 @@ mod tests {
         assert_eq!(python_output_range(100, 20, 10), (70, 90));
         assert_eq!(python_output_range(8, 20, usize::MAX), (0, 8));
         assert_eq!(python_output_range(100, 20, usize::MAX), (0, 20));
+    }
+
+    #[test]
+    fn python_scrollbar_position_uses_top_based_coordinates() {
+        assert_eq!(python_scrollbar_position(100, 20, 0), 80);
+        assert_eq!(python_scrollbar_position(100, 20, 80), 0);
     }
 
     #[test]

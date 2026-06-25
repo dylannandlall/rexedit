@@ -23,6 +23,7 @@ side-by-side diffs, customizable themes, and entropy visualization.
 - Configurable 16- or 32-byte rows, casing, offsets, ASCII, and side panes
 - Optional compression of long runs of uniform byte rows
 - Persistent Python analysis console with a mutable byte-buffer snapshot
+- Position-aware vertical scrollbars for the hex viewer and Python console
 
 ## Requirements
 
@@ -302,7 +303,8 @@ not insertion or deletion. Press `Ctrl+L` to clear the pane and Escape to
 close it. Page Up/Page Down and the mouse wheel scroll output history;
 `Ctrl+Home` and `Ctrl+End` jump to the oldest and newest output. Tab and
 Shift+Tab cycle focus between the hex viewer, fields pane, and Python console
-without ending the interpreter session.
+without ending the interpreter session. A vertical scrollbar tracks the
+currently visible section of the interpreter history.
 
 The console executes code with the same operating-system permissions as
 rexedit, so only run Python code you trust.
