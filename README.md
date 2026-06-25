@@ -295,7 +295,7 @@ The console provides:
 - `selected`, a view of the selection that was active when the pane opened;
 - `selection_start` and `selection_end`;
 - preloaded `struct`, `binascii`, `hashlib`, `base64`, `zlib`, `math`, `re`,
-  and `pathlib` modules.
+  `signal`, and `pathlib` modules.
 
 Expressions print their result and variables persist between commands. Enter
 `:apply` to copy same-length changes from `buffer` back into rexedit. Length
@@ -308,6 +308,15 @@ without ending the interpreter session. A vertical scrollbar tracks the
 currently visible section of the interpreter history. Click or drag either
 pane's scrollbar to jump through its content. Up and Down recall Python
 commands, restoring unfinished input after moving past the newest command.
+Command history survives closing and reopening the pane until rexedit exits.
+`Ctrl+C` interrupts the currently running Python command without terminating
+rexedit.
+
+This keybinding is safe on both supported terminal families. Crossterm raw mode
+delivers `Ctrl+C` to rexedit as keyboard input instead of terminating the
+application. Rexedit forwards `SIGINT` to Python on Unix; on Windows, Python is
+placed in its own process group and receives a console break event mapped to
+`KeyboardInterrupt`.
 
 The console executes code with the same operating-system permissions as
 rexedit, so only run Python code you trust.

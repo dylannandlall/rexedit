@@ -981,7 +981,7 @@ fn render_python_pane(frame: &mut Frame, pane: &PythonPane, area: Rect, active: 
         Paragraph::new(lines).wrap(Wrap { trim: false }).block(
             Block::default()
                 .title(Span::styled(
-                    " Python console — ↑/↓ history | Tab pane | PgUp/PgDn scroll | Enter run | Esc close ",
+                    " Python console — ↑/↓ history | Ctrl+C interrupt | Tab pane | Enter run | Esc close ",
                     if active {
                         Style::default()
                             .fg(Color::LightGreen)
@@ -1164,6 +1164,7 @@ fn keybinding_lines() -> Vec<Line<'static>> {
         section("Python console"),
         binding("Enter", "execute an expression or statement"),
         binding("Up / Down", "previous / next Python command"),
+        binding("Ctrl+C", "interrupt the running Python command"),
         binding("Tab / Shift+Tab", "cycle viewer, fields, and Python panes"),
         binding(":apply", "copy same-length buffer edits into rexedit"),
         binding("PgUp/PgDn / wheel", "scroll console output"),

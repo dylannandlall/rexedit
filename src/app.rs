@@ -307,6 +307,7 @@ pub struct App {
     pub theme: Theme,
     pub settings: ViewerSettings,
     pub display_rows: Vec<DisplayRow>,
+    python_history: Vec<String>,
     pub edit_mode: bool,
     pub edit_high_nibble: bool,
     pub modified_offsets: BTreeSet<usize>,
@@ -341,6 +342,7 @@ impl App {
             theme: Theme::default(),
             settings: ViewerSettings::default(),
             display_rows: Vec::new(),
+            python_history: Vec::new(),
             edit_mode: false,
             edit_high_nibble: true,
             modified_offsets: BTreeSet::new(),
@@ -1173,7 +1175,7 @@ impl App {
                     pending: 0,
                     scroll: 0,
                     visible_output_lines: 1,
-                    history: Vec::new(),
+                    history: self.python_history.clone(),
                     history_index: None,
                     history_draft: String::new(),
                 });
@@ -1186,6 +1188,9 @@ impl App {
 
     fn handle_python_key(&mut self, key: KeyEvent) {
         if key.code == KeyCode::Esc {
+            if let Mode::Python(pane) = &self.mode {
+                self.python_history = pane.history.clone();
+            }
             self.mode = Mode::Normal;
             self.focus = Focus::Viewer;
             self.status = "Python pane closed".into();
@@ -1193,6 +1198,21 @@ impl App {
         }
         if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
             self.cycle_python_focus(key.code == KeyCode::Tab);
+            return;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            let result = match &self.mode {
+                Mode::Python(pane) if pane.pending > 0 => pane.session.interrupt(),
+                Mode::Python(_) => {
+                    self.status = "No Python command is currently running".into();
+                    return;
+                }
+                _ => return,
+            };
+            self.status = match result {
+                Ok(()) => "Interrupt sent to Python".into(),
+                Err(error) => error,
+            };
             return;
         }
         if self.focus != Focus::Python {
@@ -1260,6 +1280,7 @@ impl App {
                 if pane.history.last() != Some(&command) {
                     pane.history.push(command.clone());
                 }
+                self.python_history = pane.history.clone();
                 pane.history_index = None;
                 pane.history_draft.clear();
                 let result = if command.trim() == ":apply" {
@@ -2620,6 +2641,25 @@ mod tests {
         assert_eq!(pane.input.value, "second");
         navigate_python_history(pane, false);
         assert_eq!(pane.input.value, "unfinished");
+    }
+
+    #[test]
+    fn python_history_survives_closing_and_reopening_the_pane() {
+        let mut app = App::new("sample.bin".into(), vec![0]);
+        app.open_python_pane();
+        let Mode::Python(pane) = &mut app.mode else {
+            panic!("Python should open");
+        };
+        pane.history = vec!["first".into(), "second".into()];
+
+        app.handle_python_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.python_history, ["first", "second"]);
+
+        app.open_python_pane();
+        let Mode::Python(pane) = &app.mode else {
+            panic!("Python should reopen");
+        };
+        assert_eq!(pane.history, ["first", "second"]);
     }
 
     #[test]
