@@ -1,5 +1,6 @@
 mod app;
 mod model;
+mod python;
 mod search;
 mod ui;
 
@@ -64,10 +65,13 @@ View Mode:
   i                 enter Overwrite Mode
   s                 open viewer settings
   t                 open theme customization
+  p                 open the Python buffer console
   Ctrl+F            search bytes asynchronously
   n / N             next / previous search match
   Ctrl+G            jump to an offset
   Ctrl+O / Ctrl+L   save / load an overlay
+  Ctrl+R            reset an open theme/settings menu with y/n confirmation
+  Ctrl+Z            suspend to the shell on Unix (resume with fg)
 
 Overwrite Mode:
   hexadecimal keys  overwrite the selected byte

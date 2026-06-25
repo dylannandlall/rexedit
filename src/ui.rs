@@ -7,8 +7,8 @@ use ratatui::{
 };
 
 use crate::app::{
-    App, FieldEditor, Focus, HelpViewer, Mode, PathAction, PathDialog, SettingsEditor, ThemeEditor,
-    Workspace,
+    App, DisplayRow, FieldEditor, Focus, HelpViewer, Mode, PathAction, PathDialog, PythonPane,
+    ResetTarget, SettingsEditor, ThemeEditor, Workspace,
 };
 
 pub fn render_workspace(frame: &mut Frame, workspace: &mut Workspace) {
@@ -38,6 +38,13 @@ pub fn render_workspace(frame: &mut Frame, workspace: &mut Workspace) {
 
 fn render_in(frame: &mut Frame, app: &mut App, area: Rect) {
     let [body, status] = Layout::vertical([Constraint::Min(8), Constraint::Length(3)]).areas(area);
+    let (body, python_area) = if matches!(app.mode, Mode::Python(_)) {
+        let [main, python] =
+            Layout::vertical([Constraint::Percentage(60), Constraint::Percentage(40)]).areas(body);
+        (main, Some(python))
+    } else {
+        (body, None)
+    };
     let (viewer, fields, inspector) = if app.settings.show_sidebar {
         let [viewer, sidebar] =
             Layout::horizontal([Constraint::Min(78), Constraint::Length(42)]).areas(body);
@@ -58,6 +65,9 @@ fn render_in(frame: &mut Frame, app: &mut App, area: Rect) {
     if app.settings.show_sidebar {
         render_fields(frame, app, fields);
         render_inspector(frame, app, inspector);
+    }
+    if let (Some(area), Mode::Python(pane)) = (python_area, &app.mode) {
+        render_python_pane(frame, pane, area);
     }
     render_status(frame, app, status);
 
@@ -82,6 +92,8 @@ fn render_mode_modal(frame: &mut Frame, app: &App) {
         Mode::Path(dialog) => render_path_modal(frame, dialog),
         Mode::Theme(editor) => render_theme_modal(frame, app, editor),
         Mode::Settings(editor) => render_settings_modal(frame, app, editor),
+        Mode::ConfirmReset(target) => render_reset_confirmation(frame, *target),
+        Mode::Python(_) => {}
         Mode::Help(help) => render_help_modal(frame, help),
         Mode::Normal => {}
     }
@@ -147,6 +159,10 @@ fn render_comparison(frame: &mut Frame, workspace: &mut Workspace, area: Rect) {
     let active_bytes = workspace.documents[active].bytes.clone();
     let active_scroll = workspace.documents[active].scroll;
     let active_row_width = workspace.documents[active].settings.bytes_per_row;
+    let active_top_offset = workspace.documents[active]
+        .display_rows
+        .get(active_scroll)
+        .map_or(0, |row| row.start());
     let comparison_bytes = comparison.map(|index| workspace.documents[index].bytes.clone());
 
     for (index, pane) in panes.iter().enumerate() {
@@ -160,10 +176,12 @@ fn render_comparison(frame: &mut Frame, workspace: &mut Workspace, area: Rect) {
             None
         };
         let document = &mut workspace.documents[index];
-        document.settings.bytes_per_row = active_row_width;
+        document.set_bytes_per_row(active_row_width);
         document.viewer_area = *pane;
         document.visible_rows = pane.height.saturating_sub(2) as usize;
-        document.scroll = active_scroll.min(document.max_scroll());
+        document.scroll = document
+            .display_row_for_offset(active_top_offset)
+            .min(document.max_scroll());
         let name = document
             .path
             .file_name()
@@ -229,7 +247,65 @@ fn render_viewer(
 
     for row in app.scroll..end_row {
         let bytes_per_row = app.settings.bytes_per_row;
-        let offset = row * bytes_per_row;
+        let display_row = app.display_rows[row];
+        if let DisplayRow::Repeated {
+            start,
+            end,
+            byte,
+            physical_rows,
+        } = display_row
+        {
+            let offset = app.settings.show_offsets.then(|| {
+                if app.settings.uppercase_hex {
+                    format!("{start:08X}  ")
+                } else {
+                    format!("{start:08x}  ")
+                }
+            });
+            let end = if app.settings.uppercase_hex {
+                format!("{end:08X}")
+            } else {
+                format!("{end:08x}")
+            };
+            let byte = if app.settings.uppercase_hex {
+                format!("{byte:02X}")
+            } else {
+                format!("{byte:02x}")
+            };
+            let mut spans = Vec::new();
+            if let Some(offset) = offset {
+                spans.push(Span::styled(
+                    offset,
+                    Style::default().fg(app.theme.offset.color()),
+                ));
+            }
+            let selected_offset =
+                app.selection
+                    .map(|selection| selection.cursor)
+                    .filter(|cursor| {
+                        (start..=display_row.end(bytes_per_row, app.bytes.len())).contains(cursor)
+                    });
+            let summary = if let Some(cursor) = selected_offset {
+                format!(
+                    "… {physical_rows} identical rows of {byte} compressed (through {end}; cursor {cursor:08X}) …"
+                )
+            } else {
+                format!("… {physical_rows} identical rows of {byte} compressed (through {end}) …")
+            };
+            let mut style = Style::default()
+                .fg(app.theme.hex_secondary.color())
+                .add_modifier(Modifier::ITALIC);
+            if selected_offset.is_some() {
+                style = style
+                    .bg(app.theme.selection_background.color())
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD);
+            }
+            spans.push(Span::styled(summary, style));
+            lines.push(Line::from(spans));
+            continue;
+        }
+        let offset = display_row.start();
         let chunk = &app.bytes[offset..(offset + bytes_per_row).min(app.bytes.len())];
         let mut spans = Vec::new();
         if app.settings.show_offsets {
@@ -466,11 +542,8 @@ fn inspector_lines(app: &App) -> Vec<Line<'static>> {
     }
     add_integer_lines(&mut lines, bytes);
     add_float_lines(&mut lines, bytes);
-    let text_preview = &bytes[..bytes.len().min(64)];
-    if let Ok(text) = std::str::from_utf8(text_preview)
-        && !text.is_empty()
-    {
-        lines.push(kv("UTF-8", truncate(text, 26)));
+    if !bytes.is_empty() {
+        lines.push(kv("UTF-8", utf8_preview(bytes)));
     }
     lines
 }
@@ -740,7 +813,7 @@ fn render_theme_modal(frame: &mut Frame, app: &App, editor: &ThemeEditor) {
     lines.extend([
         Line::from(""),
         Line::styled(
-            "Arrows select/change | type name | Ctrl+S save | Ctrl+L load | Enter/Esc close",
+            "Arrows change | type name | Ctrl+S/L save/load | Ctrl+R reset | Enter/Esc close",
             Style::default().fg(Color::DarkGray),
         ),
     ]);
@@ -756,7 +829,7 @@ fn render_theme_modal(frame: &mut Frame, app: &App, editor: &ThemeEditor) {
 }
 
 fn render_settings_modal(frame: &mut Frame, app: &App, editor: &SettingsEditor) {
-    let area = centered_rect(frame.area(), 66, 13);
+    let area = centered_rect(frame.area(), 70, 14);
     frame.render_widget(Clear, area);
     let enabled = |value| if value { "enabled" } else { "disabled" };
     let rows = [
@@ -771,6 +844,10 @@ fn render_settings_modal(frame: &mut Frame, app: &App, editor: &SettingsEditor) 
             enabled(app.settings.show_offsets).to_string(),
         ),
         ("Side panes", enabled(app.settings.show_sidebar).to_string()),
+        (
+            "Compress repeated rows",
+            enabled(app.settings.compress_repeated_rows).to_string(),
+        ),
     ];
     let mut lines = rows
         .iter()
@@ -785,7 +862,7 @@ fn render_settings_modal(frame: &mut Frame, app: &App, editor: &SettingsEditor) 
     lines.extend([
         Line::from(""),
         Line::styled(
-            "Up/Down select | Left/Right/Space change | Enter/Esc close",
+            "Up/Down select | Left/Right/Space change | Ctrl+R reset | Enter/Esc close",
             Style::default().fg(Color::DarkGray),
         ),
     ]);
@@ -795,6 +872,72 @@ fn render_settings_modal(frame: &mut Frame, app: &App, editor: &SettingsEditor) 
                 .title(Span::styled(" View Mode Settings ", modal_title_style()))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Cyan)),
+        ),
+        area,
+    );
+}
+
+fn render_reset_confirmation(frame: &mut Frame, target: ResetTarget) {
+    let name = match target {
+        ResetTarget::Theme => "theme",
+        ResetTarget::Settings => "viewer settings",
+    };
+    let area = centered_rect(frame.area(), 62, 7);
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(""),
+            Line::styled(
+                format!(" Reset {name} to defaults?"),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Line::from(""),
+            Line::styled(
+                " Type y to confirm or n to cancel.",
+                Style::default().fg(Color::Yellow),
+            ),
+        ])
+        .block(
+            Block::default()
+                .title(Span::styled(" Confirm reset ", modal_title_style()))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow)),
+        ),
+        area,
+    );
+}
+
+fn render_python_pane(frame: &mut Frame, pane: &PythonPane, area: Rect) {
+    let output_height = area.height.saturating_sub(4) as usize;
+    let start = pane.output.len().saturating_sub(output_height);
+    let mut lines = pane.output[start..]
+        .iter()
+        .map(|line| Line::raw(line.clone()))
+        .collect::<Vec<_>>();
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled(">>> ", Style::default().fg(Color::LightGreen)),
+        Span::raw(&pane.input.value),
+        if pane.pending > 0 {
+            Span::styled(
+                format!("  [{} running]", pane.pending),
+                Style::default().fg(Color::Yellow),
+            )
+        } else {
+            Span::raw("")
+        },
+    ]));
+    frame.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .title(Span::styled(
+                    " Python buffer console — Enter run | :apply sync | Ctrl+L clear | Esc close ",
+                    Style::default()
+                        .fg(Color::LightGreen)
+                        .add_modifier(Modifier::BOLD),
+                ))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Green)),
         ),
         area,
     );
@@ -850,6 +993,7 @@ fn keybinding_lines() -> Vec<Line<'static>> {
         binding("Ctrl+B, then S", "toggle side-by-side comparison"),
         binding("Ctrl+N", "open another binary with the system picker"),
         binding("Ctrl+D", "toggle byte diff mode"),
+        binding("Ctrl+Z", "suspend on Unix; resume with shell fg"),
         binding("e", "toggle the active binary's entropy graph"),
         binding("mouse on tab/pane", "activate that binary"),
         Line::from(""),
@@ -873,6 +1017,7 @@ fn keybinding_lines() -> Vec<Line<'static>> {
         binding("Ctrl+O / Ctrl+L", "save / load a field overlay"),
         binding("s", "open viewer settings"),
         binding("t", "open theme customization"),
+        binding("p", "open the Python buffer console"),
         Line::from(""),
         section("Overwrite Mode"),
         binding("0-9, A-F", "overwrite the selected byte, two nibbles"),
@@ -900,6 +1045,13 @@ fn keybinding_lines() -> Vec<Line<'static>> {
         binding("Enter", "confirm or close"),
         binding("Escape", "cancel or close"),
         binding("Ctrl+S / Ctrl+L", "save / load inside the theme menu"),
+        binding("Ctrl+R", "reset theme or settings after y/n confirmation"),
+        Line::from(""),
+        section("Python console"),
+        binding("Enter", "execute an expression or statement"),
+        binding(":apply", "copy same-length buffer edits into rexedit"),
+        binding("Ctrl+L", "clear console output"),
+        binding("Escape", "close the Python pane"),
         Line::from(""),
         section("General"),
         binding("?", "open this keybinding reference"),
@@ -981,6 +1133,23 @@ fn truncate(value: &str, max_chars: usize) -> String {
     output
 }
 
+fn utf8_preview(bytes: &[u8]) -> String {
+    const MAX_BYTES: usize = 4096;
+    const MAX_CHARS: usize = 256;
+
+    let inspected = &bytes[..bytes.len().min(MAX_BYTES)];
+    let decoded = String::from_utf8_lossy(inspected);
+    let mut preview: String = decoded.chars().take(MAX_CHARS).collect();
+    if decoded.chars().count() > MAX_CHARS {
+        preview.pop();
+        preview.push('…');
+    }
+    if bytes.len() > MAX_BYTES {
+        preview.push_str(&format!(" … (+{} bytes)", bytes.len() - MAX_BYTES));
+    }
+    preview
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -993,6 +1162,15 @@ mod tests {
     fn truncates_long_labels() {
         assert_eq!(truncate("abcdefghijkl", 6), "abcde…");
         assert_eq!(truncate("abc", 6), "abc");
+    }
+
+    #[test]
+    fn utf8_preview_tracks_long_and_invalid_selections() {
+        let mut bytes = vec![b'a'; 5000];
+        bytes[10] = 0xFF;
+        let preview = utf8_preview(&bytes);
+        assert!(preview.contains('�'));
+        assert!(preview.contains("+904 bytes"));
     }
 
     #[test]
