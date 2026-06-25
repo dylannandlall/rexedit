@@ -16,11 +16,6 @@ fn main() -> color_eyre::Result<()> {
     color_eyre::install()?;
 
     let arguments = env::args_os().skip(1).collect::<Vec<_>>();
-    if arguments.is_empty() {
-        return Err(color_eyre::eyre::eyre!(
-            "usage: rexedit <binary-file> [binary-file ...]"
-        ));
-    }
     if arguments
         .iter()
         .any(|argument| matches!(argument.to_str(), Some("-h" | "--help")))
@@ -50,7 +45,7 @@ fn main() -> color_eyre::Result<()> {
 
 fn print_help() {
     println!(
-        "rexedit <binary-file> [binary-file ...]
+        "rexedit [binary-file ...]
 
 Workspace:
   Ctrl+B, Right     activate the next binary

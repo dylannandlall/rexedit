@@ -16,6 +16,12 @@ pub fn render_workspace(frame: &mut Frame, workspace: &mut Workspace) {
         Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(frame.area());
     render_tabs(frame, workspace, tabs);
 
+    if workspace.documents.is_empty() {
+        workspace.comparison_panes.clear();
+        render_empty_workspace(frame, workspace, content);
+        return;
+    }
+
     let content = if workspace.show_entropy {
         let [main, entropy] =
             Layout::vertical([Constraint::Percentage(72), Constraint::Percentage(28)])
@@ -34,6 +40,34 @@ pub fn render_workspace(frame: &mut Frame, workspace: &mut Workspace) {
         let active = workspace.active;
         render_in(frame, &mut workspace.documents[active], content);
     }
+}
+
+fn render_empty_workspace(frame: &mut Frame, workspace: &Workspace, area: Rect) {
+    let area = centered_rect(area, 72, 11);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(""),
+            Line::styled(
+                "No binary is open",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Line::from(""),
+            Line::from("Press Ctrl+N to choose a binary with the system file picker."),
+            Line::from(""),
+            Line::styled("q quits", Style::default().fg(Color::DarkGray)),
+            Line::from(""),
+            Line::styled(&workspace.status, Style::default().fg(Color::Yellow)),
+        ])
+        .block(
+            Block::default()
+                .title(" rexedit ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+        ),
+        area,
+    );
 }
 
 fn render_in(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -909,8 +943,8 @@ fn render_reset_confirmation(frame: &mut Frame, target: ResetTarget) {
 
 fn render_python_pane(frame: &mut Frame, pane: &PythonPane, area: Rect) {
     let output_height = area.height.saturating_sub(4) as usize;
-    let start = pane.output.len().saturating_sub(output_height);
-    let mut lines = pane.output[start..]
+    let (start, end) = python_output_range(pane.output.len(), output_height, pane.scroll);
+    let mut lines = pane.output[start..end]
         .iter()
         .map(|line| Line::raw(line.clone()))
         .collect::<Vec<_>>();
@@ -931,7 +965,7 @@ fn render_python_pane(frame: &mut Frame, pane: &PythonPane, area: Rect) {
         Paragraph::new(lines).wrap(Wrap { trim: false }).block(
             Block::default()
                 .title(Span::styled(
-                    " Python buffer console — Enter run | :apply sync | Ctrl+L clear | Esc close ",
+                    " Python console — PgUp/PgDn or wheel scroll | Enter run | :apply sync | Esc close ",
                     Style::default()
                         .fg(Color::LightGreen)
                         .add_modifier(Modifier::BOLD),
@@ -941,6 +975,11 @@ fn render_python_pane(frame: &mut Frame, pane: &PythonPane, area: Rect) {
         ),
         area,
     );
+}
+
+fn python_output_range(length: usize, height: usize, scroll: usize) -> (usize, usize) {
+    let end = length.saturating_sub(scroll.min(length));
+    (end.saturating_sub(height), end)
 }
 
 fn render_help_modal(frame: &mut Frame, help: &HelpViewer) {
@@ -1050,6 +1089,8 @@ fn keybinding_lines() -> Vec<Line<'static>> {
         section("Python console"),
         binding("Enter", "execute an expression or statement"),
         binding(":apply", "copy same-length buffer edits into rexedit"),
+        binding("PgUp/PgDn / wheel", "scroll console output"),
+        binding("Ctrl+Home / Ctrl+End", "oldest / newest console output"),
         binding("Ctrl+L", "clear console output"),
         binding("Escape", "close the Python pane"),
         Line::from(""),
@@ -1174,6 +1215,13 @@ mod tests {
     }
 
     #[test]
+    fn python_output_range_scrolls_back_through_history() {
+        assert_eq!(python_output_range(100, 20, 0), (80, 100));
+        assert_eq!(python_output_range(100, 20, 10), (70, 90));
+        assert_eq!(python_output_range(8, 20, usize::MAX), (0, 0));
+    }
+
+    #[test]
     fn renders_the_complete_workspace() {
         let backend = TestBackend::new(130, 36);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -1194,6 +1242,28 @@ mod tests {
         assert!(rendered.contains("Hex Viewer - View Mode"));
         assert!(rendered.contains("Inspector"));
         assert!(rendered.contains("Fields"));
+    }
+
+    #[test]
+    fn renders_empty_workspace_file_opening_prompt() {
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut workspace = Workspace::new(Vec::new());
+        terminal
+            .draw(|frame| render_workspace(frame, &mut workspace))
+            .unwrap();
+        let rendered =
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .fold(String::new(), |mut output, cell| {
+                    output.push_str(cell.symbol());
+                    output
+                });
+        assert!(rendered.contains("No binary is open"));
+        assert!(rendered.contains("Ctrl+N"));
     }
 
     #[test]

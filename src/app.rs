@@ -179,6 +179,7 @@ pub struct PythonPane {
     pub output: Vec<String>,
     pub session: PythonSession,
     pub pending: usize,
+    pub scroll: usize,
 }
 
 #[derive(Debug, Default)]
@@ -413,6 +414,17 @@ impl Workspace {
     }
 
     fn handle_workspace_key(&mut self, key: KeyEvent) -> io::Result<bool> {
+        if self.documents.is_empty() {
+            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('n') {
+                self.open_binary_picker();
+                return Ok(false);
+            }
+            if key.code == KeyCode::Char('q') {
+                return Ok(true);
+            }
+            self.status = "No binary open — Ctrl+N opens a file; q quits".into();
+            return Ok(false);
+        }
         if self.tab_switch_pending {
             self.tab_switch_pending = false;
             match key.code {
@@ -467,6 +479,9 @@ impl Workspace {
     }
 
     pub(crate) fn handle_workspace_mouse(&mut self, mouse: MouseEvent) {
+        if self.documents.is_empty() {
+            return;
+        }
         if mouse.row == self.tab_row
             && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
             && let Some(index) = self
@@ -541,13 +556,17 @@ impl Workspace {
                 Err(error) => {
                     let message = format!("Could not open {}: {error}", path.display());
                     self.status = message.clone();
-                    self.active_mut().status = message;
+                    if let Some(document) = self.documents.get_mut(self.active) {
+                        document.status = message;
+                    }
                 }
             },
             Ok(None) => self.status = "Open cancelled".into(),
             Err(error) => {
                 self.status = error.clone();
-                self.active_mut().status = error;
+                if let Some(document) = self.documents.get_mut(self.active) {
+                    document.status = error;
+                }
             }
         }
     }
@@ -1127,6 +1146,7 @@ impl App {
                     ],
                     session,
                     pending: 0,
+                    scroll: 0,
                 });
                 self.status = "Python pane opened".into();
             }
@@ -1143,8 +1163,36 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('l') {
             if let Mode::Python(pane) = &mut self.mode {
                 pane.output.clear();
+                pane.scroll = 0;
             }
             return;
+        }
+        match key.code {
+            KeyCode::PageUp => {
+                if let Mode::Python(pane) = &mut self.mode {
+                    pane.scroll = pane.scroll.saturating_add(10).min(pane.output.len());
+                }
+                return;
+            }
+            KeyCode::PageDown => {
+                if let Mode::Python(pane) = &mut self.mode {
+                    pane.scroll = pane.scroll.saturating_sub(10);
+                }
+                return;
+            }
+            KeyCode::Home if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Mode::Python(pane) = &mut self.mode {
+                    pane.scroll = pane.output.len();
+                }
+                return;
+            }
+            KeyCode::End if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Mode::Python(pane) = &mut self.mode {
+                    pane.scroll = 0;
+                }
+                return;
+            }
+            _ => {}
         }
         if key.code == KeyCode::Enter {
             let command = match &mut self.mode {
@@ -1156,6 +1204,7 @@ impl App {
             }
             let result = if let Mode::Python(pane) = &mut self.mode {
                 pane.output.push(format!(">>> {command}"));
+                pane.scroll = 0;
                 let result = if command.trim() == ":apply" {
                     pane.session.apply()
                 } else {
@@ -1194,6 +1243,7 @@ impl App {
                     if let Some(error) = response.error {
                         pane.output.push(error);
                     }
+                    pane.scroll = 0;
                     response.applied.then(|| pane.session.snapshot.clone())
                 }
                 _ => None,
@@ -1265,6 +1315,18 @@ impl App {
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) {
+        if let Mode::Python(pane) = &mut self.mode {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => {
+                    pane.scroll = pane.scroll.saturating_add(3).min(pane.output.len());
+                }
+                MouseEventKind::ScrollDown => {
+                    pane.scroll = pane.scroll.saturating_sub(3);
+                }
+                _ => {}
+            }
+            return;
+        }
         if !matches!(self.mode, Mode::Normal) {
             return;
         }
@@ -2225,6 +2287,23 @@ mod tests {
             .handle_workspace_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE))
             .unwrap();
         assert_eq!(workspace.active, 0);
+    }
+
+    #[test]
+    fn empty_workspace_can_wait_for_a_file_or_quit() {
+        let mut workspace = Workspace::new(Vec::new());
+        assert!(
+            workspace
+                .handle_workspace_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
+                .unwrap()
+        );
+
+        assert!(
+            !workspace
+                .handle_workspace_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))
+                .unwrap()
+        );
+        assert!(workspace.status.contains("Ctrl+N"));
     }
 
     #[test]

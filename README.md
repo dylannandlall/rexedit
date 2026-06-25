@@ -142,6 +142,12 @@ Open one binary:
 rexedit firmware.bin
 ```
 
+Launch without a file and open one later with `Ctrl+N`:
+
+```bash
+rexedit
+```
+
 Open several binaries in one workspace:
 
 ```bash
@@ -293,7 +299,8 @@ Expressions print their result and variables persist between commands. Enter
 `:apply` to copy same-length changes from `buffer` back into rexedit. Length
 changes are rejected because the editor currently supports byte overwrite,
 not insertion or deletion. Press `Ctrl+L` to clear the pane and Escape to
-close it.
+close it. Page Up/Page Down and the mouse wheel scroll output history;
+`Ctrl+Home` and `Ctrl+End` jump to the oldest and newest output.
 
 The console executes code with the same operating-system permissions as
 rexedit, so only run Python code you trust.
