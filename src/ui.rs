@@ -814,7 +814,7 @@ fn render_field_modal(frame: &mut Frame, editor: &FieldEditor) {
         .chain([
             Line::from(""),
             Line::styled(
-                "Tab/Up/Down field | Left/Right color | Enter save | Esc cancel",
+                "Tab/Up/Down field | Left/Right color backward/forward | Enter save | Esc cancel",
                 Style::default().fg(Color::DarkGray),
             ),
         ])
@@ -1116,6 +1116,7 @@ fn keybinding_lines() -> Vec<Line<'static>> {
         binding("Shift+arrows", "extend the byte selection"),
         binding("Page Up / Page Down", "move by one visible page"),
         binding("Home / End", "jump to the start / end of the file"),
+        binding("gg / Shift+G", "jump to the start / end of the file"),
         binding("mouse drag", "select a range of bytes"),
         binding("mouse wheel", "scroll the hex viewer"),
         binding("i", "enter Overwrite Mode"),

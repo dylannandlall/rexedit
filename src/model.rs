@@ -53,21 +53,35 @@ impl Field {
 pub enum FieldColor {
     #[default]
     Cyan,
+    LightCyan,
     Green,
+    LightGreen,
     Yellow,
+    LightYellow,
     Magenta,
+    LightMagenta,
     Blue,
+    LightBlue,
     Red,
+    LightRed,
+    Gray,
 }
 
 impl FieldColor {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 13] = [
         Self::Cyan,
+        Self::LightCyan,
         Self::Green,
+        Self::LightGreen,
         Self::Yellow,
+        Self::LightYellow,
         Self::Magenta,
+        Self::LightMagenta,
         Self::Blue,
+        Self::LightBlue,
         Self::Red,
+        Self::LightRed,
+        Self::Gray,
     ];
 
     pub fn next(self) -> Self {
@@ -78,25 +92,47 @@ impl FieldColor {
         Self::ALL[(index + 1) % Self::ALL.len()]
     }
 
+    pub fn previous(self) -> Self {
+        let index = Self::ALL
+            .iter()
+            .position(|color| *color == self)
+            .unwrap_or(0);
+        Self::ALL[index.checked_sub(1).unwrap_or(Self::ALL.len() - 1)]
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             Self::Cyan => "cyan",
+            Self::LightCyan => "light cyan",
             Self::Green => "green",
+            Self::LightGreen => "light green",
             Self::Yellow => "yellow",
+            Self::LightYellow => "light yellow",
             Self::Magenta => "magenta",
+            Self::LightMagenta => "light magenta",
             Self::Blue => "blue",
+            Self::LightBlue => "light blue",
             Self::Red => "red",
+            Self::LightRed => "light red",
+            Self::Gray => "gray",
         }
     }
 
     pub fn color(self) -> Color {
         match self {
             Self::Cyan => Color::Cyan,
+            Self::LightCyan => Color::LightCyan,
             Self::Green => Color::Green,
+            Self::LightGreen => Color::LightGreen,
             Self::Yellow => Color::Yellow,
+            Self::LightYellow => Color::LightYellow,
             Self::Magenta => Color::Magenta,
+            Self::LightMagenta => Color::LightMagenta,
             Self::Blue => Color::Blue,
+            Self::LightBlue => Color::LightBlue,
             Self::Red => Color::Red,
+            Self::LightRed => Color::LightRed,
+            Self::Gray => Color::Gray,
         }
     }
 }

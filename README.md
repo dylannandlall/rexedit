@@ -195,6 +195,9 @@ aligned.
 | --- | --- |
 | Arrow keys | Move the byte cursor |
 | Shift + arrows | Extend the selection |
+| `Page Up` / `Page Down` | Move by one visible page |
+| `Home` / `End` | Jump to the start or end of the file |
+| `gg` / `Shift+G` | Vim-style jump to the start or end of the file |
 | Mouse drag | Select a byte range |
 | Mouse wheel | Scroll |
 | `i` | Enter Overwrite Mode |

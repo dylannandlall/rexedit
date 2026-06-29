@@ -316,6 +316,7 @@ pub struct App {
     pending_edit: Option<PendingEdit>,
     mouse_dragging: bool,
     scrollbar_dragging: Option<ScrollbarDrag>,
+    vim_g_pending: bool,
     quit_armed: bool,
     pub entropy: Option<Vec<f64>>,
 }
@@ -351,6 +352,7 @@ impl App {
             pending_edit: None,
             mouse_dragging: false,
             scrollbar_dragging: None,
+            vim_g_pending: false,
             quit_armed: false,
             entropy: None,
         };
@@ -783,6 +785,7 @@ impl App {
 
     fn handle_view_key(&mut self, key: KeyEvent) -> io::Result<bool> {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.vim_g_pending = false;
             match key.code {
                 KeyCode::Char('f') => {
                     self.mode = Mode::Search(TextInput {
@@ -819,6 +822,20 @@ impl App {
             KeyCode::Char('p') => self.open_python_pane(),
             KeyCode::Char('n') => self.next_search_result(),
             KeyCode::Char('N') => self.previous_search_result(),
+            KeyCode::Char('g') => {
+                if self.vim_g_pending {
+                    self.select_offset(0, false);
+                    self.status = "Jumped to start of file".into();
+                    self.vim_g_pending = false;
+                } else {
+                    self.vim_g_pending = true;
+                    self.status = "Press g again to jump to the start".into();
+                }
+            }
+            KeyCode::Char('G') if !self.bytes.is_empty() => {
+                self.select_offset(self.bytes.len() - 1, false);
+                self.status = "Jumped to end of file".into();
+            }
             KeyCode::Tab => {
                 self.focus = match self.focus {
                     Focus::Viewer => Focus::Fields,
@@ -865,6 +882,9 @@ impl App {
                 );
             }
             _ => {}
+        }
+        if key.code != KeyCode::Char('g') {
+            self.vim_g_pending = false;
         }
         if key.code != KeyCode::Char('q') {
             self.quit_armed = false;
@@ -1021,7 +1041,11 @@ impl App {
                 if let Mode::Field(editor) = &mut self.mode
                     && editor.active == 4
                 {
-                    editor.color = editor.color.next();
+                    editor.color = if key.code == KeyCode::Right {
+                        editor.color.next()
+                    } else {
+                        editor.color.previous()
+                    };
                 }
             }
             KeyCode::Enter => self.commit_field_editor(),
@@ -1219,6 +1243,7 @@ impl App {
             self.handle_python_content_key(key);
             return;
         }
+        self.vim_g_pending = false;
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('l') {
             if let Mode::Python(pane) = &mut self.mode {
                 pane.output.clear();
@@ -1361,9 +1386,26 @@ impl App {
                     key.modifiers.contains(KeyModifiers::SHIFT),
                 );
             }
+            (Focus::Viewer, KeyCode::Char('g')) => {
+                if self.vim_g_pending {
+                    self.select_offset(0, false);
+                    self.status = "Python mode: jumped to start of file".into();
+                    self.vim_g_pending = false;
+                } else {
+                    self.vim_g_pending = true;
+                    self.status = "Python mode: press g again to jump to the start".into();
+                }
+            }
+            (Focus::Viewer, KeyCode::Char('G')) if !self.bytes.is_empty() => {
+                self.select_offset(self.bytes.len() - 1, false);
+                self.status = "Python mode: jumped to end of file".into();
+            }
             (Focus::Fields, KeyCode::Up | KeyCode::Char('[')) => self.select_previous_field(),
             (Focus::Fields, KeyCode::Down | KeyCode::Char(']')) => self.select_next_field(),
             _ => {}
+        }
+        if key.code != KeyCode::Char('g') {
+            self.vim_g_pending = false;
         }
     }
 
@@ -2513,6 +2555,52 @@ mod tests {
             .unwrap();
         assert_eq!(app.theme, Theme::default());
         assert!(matches!(app.mode, Mode::Theme(_)));
+    }
+
+    #[test]
+    fn field_color_arrows_move_backward_and_forward() {
+        let mut app = App::new("sample.bin".into(), vec![0; 16]);
+        app.mode = Mode::Field(FieldEditor {
+            editing: None,
+            name: "field".into(),
+            description: String::new(),
+            start: "0".into(),
+            end: "1".into(),
+            color: FieldColor::Green,
+            active: 4,
+        });
+
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE))
+            .unwrap();
+        let Mode::Field(editor) = &app.mode else {
+            panic!("field editor should remain open");
+        };
+        assert_eq!(editor.color, FieldColor::LightCyan);
+
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE))
+            .unwrap();
+        let Mode::Field(editor) = &app.mode else {
+            panic!("field editor should remain open");
+        };
+        assert_eq!(editor.color, FieldColor::Green);
+    }
+
+    #[test]
+    fn vim_style_g_keys_jump_to_file_edges() {
+        let mut app = App::new("sample.bin".into(), vec![0; 64]);
+        app.select_offset(32, false);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.selection.unwrap().cursor, 32);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.selection.unwrap().cursor, 0);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT))
+            .unwrap();
+        assert_eq!(app.selection.unwrap().cursor, 63);
     }
 
     #[test]
