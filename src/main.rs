@@ -52,7 +52,7 @@ Workspace:
   Ctrl+B, Left      activate the previous binary
   Ctrl+B, S         toggle side-by-side comparison
   Mouse click       activate a binary tab
-  Ctrl+N            open another binary with the system file picker
+  Ctrl+N            choose a system picker or type a binary path
   Ctrl+D            toggle byte diff
   e                 toggle active-binary entropy graph
 
@@ -64,6 +64,9 @@ View Mode:
   Ctrl+F            search bytes asynchronously
   n / N             next / previous search match
   Ctrl+G            jump to an offset
+  gg / G            jump to the start / end of the file
+  Ctrl+U / Ctrl+R   undo / redo a byte overwrite
+  Ctrl+S            save the edited binary
   Ctrl+O / Ctrl+L   save / load an overlay
   Ctrl+R            reset an open theme/settings menu with y/n confirmation
   Ctrl+Z            suspend to the shell on Unix (resume with fg)
