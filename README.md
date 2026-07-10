@@ -204,6 +204,7 @@ aligned.
 | `Ctrl+F` | Search the binary |
 | `n` / `N` | Next or previous search result |
 | `Ctrl+G` | Jump to an offset |
+| `Ctrl+Shift+C` | Copy the selection as continuous hexadecimal (for example, `DEADBEEF`) |
 | `Ctrl+U` / `Ctrl+R` | Undo or redo a byte overwrite |
 | `Ctrl+S` | Save the edited binary |
 | `a` | Create a field from the selection |
@@ -233,6 +234,9 @@ highlighted, and quitting with unsaved edits requires confirmation.
 
 Searches run on a worker thread and stream matches back to the interface, so
 the binary remains navigable during long searches.
+
+The search dialog briefly lists the available formats: hexadecimal, decimal,
+binary, and regular expressions.
 
 ```text
 DE AD BE EF
