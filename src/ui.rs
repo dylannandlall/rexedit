@@ -128,7 +128,7 @@ fn render_mode_modal(frame: &mut Frame, app: &App) {
             frame,
             " Search bytes ",
             &input.value,
-            "Enter starts a background search. Browse normally; n/N visits matches.",
+            "Hex (DE AD/0xDEAD), dec:, bin:, or re: | Enter search | n/N matches",
         ),
         Mode::Jump(input) => render_input_modal(
             frame,
@@ -1122,7 +1122,7 @@ fn render_help_modal(frame: &mut Frame, help: &HelpViewer) {
             .block(
                 Block::default()
                     .title(Span::styled(
-                        " Keybindings - Up/Down or PgUp/PgDn scroll; Esc/?/q closes ",
+                        " Keybindings - keys or mouse wheel scroll; Esc/?/q closes ",
                         modal_title_style(),
                     ))
                     .borders(Borders::ALL)
@@ -1174,6 +1174,10 @@ fn keybinding_lines() -> Vec<Line<'static>> {
         binding("n / N", "next / previous search result"),
         binding("Ctrl+Down / Ctrl+Up", "next / previous search result"),
         binding("Ctrl+G", "jump to a decimal or hexadecimal offset"),
+        binding(
+            "Ctrl+Shift+C",
+            "copy the selection as continuous hexadecimal",
+        ),
         binding("Ctrl+U / Ctrl+R", "undo / redo byte overwrites"),
         binding("Ctrl+S", "save the edited binary"),
         binding("a", "create a field from the current selection"),

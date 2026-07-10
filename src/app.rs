@@ -9,14 +9,18 @@ use std::{
 };
 
 #[cfg(windows)]
+use std::{io::Write, process::Stdio};
+
+#[cfg(windows)]
 use std::os::windows::process::CommandExt;
+
+#[cfg(not(windows))]
+use crossterm::{clipboard::CopyToClipboard, execute};
 
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
     MouseEventKind,
 };
-#[cfg(unix)]
-use crossterm::execute;
 use ratatui::{DefaultTerminal, layout::Rect};
 
 use crate::{
@@ -856,6 +860,9 @@ impl App {
                 KeyCode::Char('u') => self.undo_overwrite(),
                 KeyCode::Char('r') => self.redo_overwrite(),
                 KeyCode::Char('s') => self.open_path_dialog(PathAction::SaveBinary),
+                KeyCode::Char('c' | 'C') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    self.copy_selection_as_hex()
+                }
                 KeyCode::Up => self.previous_search_result(),
                 KeyCode::Down => self.next_search_result(),
                 _ => {}
@@ -946,6 +953,9 @@ impl App {
                 KeyCode::Char('s') => {
                     self.commit_pending_edit();
                     self.open_path_dialog(PathAction::SaveBinary);
+                }
+                KeyCode::Char('c' | 'C') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    self.copy_selection_as_hex()
                 }
                 _ => {}
             }
@@ -1521,6 +1531,14 @@ impl App {
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) {
+        if let Mode::Help(help) = &mut self.mode {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => help.scroll = help.scroll.saturating_sub(3),
+                MouseEventKind::ScrollDown => help.scroll = help.scroll.saturating_add(3),
+                _ => {}
+            }
+            return;
+        }
         if self.handle_scrollbar_mouse(mouse) {
             return;
         }
@@ -1728,6 +1746,18 @@ impl App {
             self.selection = Some(Selection::new(offset));
         }
         self.ensure_visible(offset);
+    }
+
+    fn copy_selection_as_hex(&mut self) {
+        let hex = hex_string(self.current_bytes());
+        if hex.is_empty() {
+            self.status = "No bytes selected to copy".into();
+            return;
+        }
+        match copy_to_clipboard(&hex) {
+            Ok(()) => self.status = format!("Copied {} bytes as continuous hex", hex.len() / 2),
+            Err(error) => self.status = format!("Could not copy selection: {error}"),
+        }
     }
 
     fn overwrite_nibble(&mut self, nibble: u8) {
@@ -2377,6 +2407,55 @@ fn nonempty_output(output: &[u8]) -> Option<String> {
     if value.is_empty() { None } else { Some(value) }
 }
 
+fn hex_string(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02X}")).collect()
+}
+
+#[cfg(windows)]
+fn copy_to_clipboard(content: &str) -> Result<(), String> {
+    let mut command = Command::new("powershell.exe");
+    command
+        .args([
+            "-NoProfile",
+            "-STA",
+            "-Command",
+            "Set-Clipboard -Value ([Console]::In.ReadToEnd())",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .creation_flags(0x0800_0000);
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("could not start the clipboard command: {error}"))?;
+    let stdin = child
+        .stdin
+        .as_mut()
+        .ok_or_else(|| "clipboard command did not accept input".to_string())?;
+    stdin
+        .write_all(content.as_bytes())
+        .map_err(|error| format!("could not write clipboard data: {error}"))?;
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("clipboard command failed: {error}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let error = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        Err(if error.is_empty() {
+            "clipboard command did not complete successfully".into()
+        } else {
+            error
+        })
+    }
+}
+
+#[cfg(not(windows))]
+fn copy_to_clipboard(content: &str) -> Result<(), String> {
+    execute!(io::stdout(), CopyToClipboard::to_clipboard_from(content))
+        .map_err(|error| error.to_string())
+}
+
 fn calculate_entropy(bytes: &[u8]) -> Vec<f64> {
     if bytes.is_empty() {
         return vec![0.0];
@@ -2476,6 +2555,11 @@ mod tests {
     fn parses_decimal_and_hex_offsets() {
         assert_eq!(parse_offset("42").unwrap(), 42);
         assert_eq!(parse_offset("0x2A").unwrap(), 42);
+    }
+
+    #[test]
+    fn copies_selected_bytes_as_continuous_hex() {
+        assert_eq!(hex_string(&[0xDE, 0xAD, 0x00, 0xEF]), "DEAD00EF");
     }
 
     #[test]
@@ -2888,6 +2972,33 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
             .unwrap();
         assert!(matches!(app.mode, Mode::Normal));
+    }
+
+    #[test]
+    fn help_window_scrolls_with_the_mouse_wheel() {
+        let mut app = App::new("sample.bin".into(), vec![0; 16]);
+        app.mode = Mode::Help(HelpViewer::default());
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+        let Mode::Help(help) = &app.mode else {
+            panic!("help should remain open");
+        };
+        assert_eq!(help.scroll, 3);
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+        let Mode::Help(help) = &app.mode else {
+            panic!("help should remain open");
+        };
+        assert_eq!(help.scroll, 0);
     }
 
     #[test]

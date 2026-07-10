@@ -64,6 +64,7 @@ View Mode:
   Ctrl+F            search bytes asynchronously
   n / N             next / previous search match
   Ctrl+G            jump to an offset
+  Ctrl+Shift+C      copy the selection as continuous hexadecimal
   gg / G            jump to the start / end of the file
   Ctrl+U / Ctrl+R   undo / redo a byte overwrite
   Ctrl+S            save the edited binary
