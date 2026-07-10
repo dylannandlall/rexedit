@@ -10,8 +10,8 @@ use ratatui::{
 };
 
 use crate::app::{
-    App, DisplayRow, FieldEditor, Focus, HelpViewer, Mode, PathAction, PathDialog, PythonPane,
-    ResetTarget, SettingsEditor, ThemeEditor, Workspace,
+    App, DisplayRow, FieldEditor, Focus, HelpViewer, Mode, OpenFileDialog, PathAction, PathDialog,
+    PythonPane, ResetTarget, SettingsEditor, ThemeEditor, Workspace,
 };
 
 pub fn render_workspace(frame: &mut Frame, workspace: &mut Workspace) {
@@ -22,6 +22,9 @@ pub fn render_workspace(frame: &mut Frame, workspace: &mut Workspace) {
     if workspace.documents.is_empty() {
         workspace.comparison_panes.clear();
         render_empty_workspace(frame, workspace, content);
+        if let Some(dialog) = &workspace.open_file_dialog {
+            render_open_file_modal(frame, dialog);
+        }
         return;
     }
 
@@ -43,6 +46,9 @@ pub fn render_workspace(frame: &mut Frame, workspace: &mut Workspace) {
         let active = workspace.active;
         render_in(frame, &mut workspace.documents[active], content);
     }
+    if let Some(dialog) = &workspace.open_file_dialog {
+        render_open_file_modal(frame, dialog);
+    }
 }
 
 fn render_empty_workspace(frame: &mut Frame, workspace: &Workspace, area: Rect) {
@@ -57,7 +63,7 @@ fn render_empty_workspace(frame: &mut Frame, workspace: &Workspace, area: Rect) 
                     .add_modifier(Modifier::BOLD),
             ),
             Line::from(""),
-            Line::from("Press Ctrl+N to choose a binary with the system file picker."),
+            Line::from("Press Ctrl+N to choose a system picker or type a binary path."),
             Line::from(""),
             Line::styled("q quits", Style::default().fg(Color::DarkGray)),
             Line::from(""),
@@ -738,7 +744,7 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
     let help = if app.edit_mode {
         "Ctrl+B then Left/Right binary | hex overwrite | Ctrl+U/R undo/redo | Ctrl+S save | Esc View Mode | ? keybinds"
     } else {
-        "Ctrl+B then Left/Right binary, S compare | Ctrl+N open | Ctrl+F search | Ctrl+G jump | i edit | ? keybinds"
+        "Ctrl+B then Left/Right binary, S compare | Ctrl+U/R undo/redo | Ctrl+S save | Ctrl+F search | i edit | ? keybinds"
     };
     let third = Line::styled(help, Style::default().fg(Color::DarkGray));
     frame.render_widget(Paragraph::new(vec![first, second, third]), area);
@@ -784,6 +790,48 @@ fn render_path_modal(frame: &mut Frame, dialog: &PathDialog) {
     render_input_modal(frame, title, &dialog.input.value, help);
 }
 
+fn render_open_file_modal(frame: &mut Frame, dialog: &OpenFileDialog) {
+    match dialog {
+        OpenFileDialog::Choice { active } => {
+            let area = centered_rect(frame.area(), 62, 9);
+            frame.render_widget(Clear, area);
+            let options = ["Use system file picker", "Type a full or relative path"];
+            let lines = options
+                .iter()
+                .enumerate()
+                .map(|(index, option)| {
+                    Line::styled(
+                        format!(" {} {option}", if index == *active { ">" } else { " " }),
+                        selected_row(index == *active),
+                    )
+                })
+                .chain([
+                    Line::from(""),
+                    Line::styled(
+                        "Up/Down or Tab select | Enter confirm | Esc cancel",
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ])
+                .collect::<Vec<_>>();
+            frame.render_widget(
+                Paragraph::new(lines).block(
+                    Block::default()
+                        .title(Span::styled(" Open binary ", modal_title_style()))
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::Cyan)),
+                ),
+                area,
+            );
+        }
+        OpenFileDialog::ManualPath { input } => render_input_modal(
+            frame,
+            " Open binary by path ",
+            &input.value,
+            "Enter a full or relative path | Enter open | Esc cancel",
+        ),
+    }
+}
+
 fn input_line(value: &str) -> Line<'static> {
     Line::styled(
         format!(" {value}"),
@@ -814,7 +862,7 @@ fn render_field_modal(frame: &mut Frame, editor: &FieldEditor) {
         .chain([
             Line::from(""),
             Line::styled(
-                "Tab/Up/Down field | Left/Right color | Enter save | Esc cancel",
+                "Tab/Up/Down field | Backspace/Ctrl+H erase | Enter save | Esc cancel",
                 Style::default().fg(Color::DarkGray),
             ),
         ])
@@ -1105,7 +1153,7 @@ fn keybinding_lines() -> Vec<Line<'static>> {
         binding("Ctrl+B, then Right", "activate the next binary"),
         binding("Ctrl+B, then Left", "activate the previous binary"),
         binding("Ctrl+B, then S", "toggle side-by-side comparison"),
-        binding("Ctrl+N", "open another binary with the system picker"),
+        binding("Ctrl+N", "choose system picker or type a binary path"),
         binding("Ctrl+D", "toggle byte diff mode"),
         binding("Ctrl+Z", "suspend on Unix; resume with shell fg"),
         binding("e", "toggle the active binary's entropy graph"),
@@ -1115,7 +1163,10 @@ fn keybinding_lines() -> Vec<Line<'static>> {
         binding("arrows", "move the byte cursor"),
         binding("Shift+arrows", "extend the byte selection"),
         binding("Page Up / Page Down", "move by one visible page"),
-        binding("Home / End", "jump to the start / end of the file"),
+        binding(
+            "Home / End or gg / G",
+            "jump to the start / end of the file",
+        ),
         binding("mouse drag", "select a range of bytes"),
         binding("mouse wheel", "scroll the hex viewer"),
         binding("i", "enter Overwrite Mode"),
@@ -1123,6 +1174,8 @@ fn keybinding_lines() -> Vec<Line<'static>> {
         binding("n / N", "next / previous search result"),
         binding("Ctrl+Down / Ctrl+Up", "next / previous search result"),
         binding("Ctrl+G", "jump to a decimal or hexadecimal offset"),
+        binding("Ctrl+U / Ctrl+R", "undo / redo byte overwrites"),
+        binding("Ctrl+S", "save the edited binary"),
         binding("a", "create a field from the current selection"),
         binding("Tab", "switch between viewer and fields pane"),
         binding("Enter", "edit the selected field"),
@@ -1139,8 +1192,7 @@ fn keybinding_lines() -> Vec<Line<'static>> {
             "arrows / Page Up/Down",
             "navigate without leaving overwrite mode",
         ),
-        binding("Ctrl+U", "undo the previous byte overwrite"),
-        binding("Ctrl+R", "redo the previous byte overwrite"),
+        binding("Ctrl+U / Ctrl+R", "undo / redo byte overwrites"),
         binding("Ctrl+S", "save the edited binary"),
         binding("Escape", "return to View Mode"),
         Line::from(""),

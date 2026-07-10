@@ -79,7 +79,8 @@ rexedit C:\path\to\file.bin
 ```
 
 The Windows file picker used by `Ctrl+N` is provided by Windows Forms and does
-not require an additional package.
+not require an additional package. The open dialog also lets you type a full or
+relative path manually.
 
 ### Linux
 
@@ -118,7 +119,8 @@ not require an additional package.
    ```
 
    `kdialog` is also supported. On WSL, `rexedit` uses the Windows file picker
-   and translates the selected path with `wslpath`.
+   and translates the selected path with `wslpath`. You can always choose the
+   manual-path option instead, including when no graphical picker is installed.
 
 4. Clone, build, and run:
 
@@ -180,7 +182,7 @@ reference.
 | `Ctrl+B`, then Right | Activate the next binary |
 | `Ctrl+B`, then Left | Activate the previous binary |
 | `Ctrl+B`, then `S` | Toggle side-by-side comparison |
-| `Ctrl+N` | Open another binary with the system file picker |
+| `Ctrl+N` | Choose the system file picker or type a full or relative path |
 | `Ctrl+D` | Toggle byte-difference highlighting |
 | `e` | Toggle the active binary's entropy graph |
 | Mouse click on a tab or pane | Activate that binary |
@@ -195,12 +197,15 @@ aligned.
 | --- | --- |
 | Arrow keys | Move the byte cursor |
 | Shift + arrows | Extend the selection |
+| `gg` / `Shift+G` | Vim-style jump to the start or end of the file |
 | Mouse drag | Select a byte range |
 | Mouse wheel | Scroll |
 | `i` | Enter Overwrite Mode |
 | `Ctrl+F` | Search the binary |
 | `n` / `N` | Next or previous search result |
 | `Ctrl+G` | Jump to an offset |
+| `Ctrl+U` / `Ctrl+R` | Undo or redo a byte overwrite |
+| `Ctrl+S` | Save the edited binary |
 | `a` | Create a field from the selection |
 | `Tab` | Switch between the viewer and field pane |
 | `Enter` | Edit the selected field |
@@ -217,8 +222,7 @@ aligned.
 | --- | --- |
 | `0`–`9`, `A`–`F` | Overwrite the selected byte |
 | Arrow keys | Move the byte cursor |
-| `Ctrl+U` | Undo an overwrite |
-| `Ctrl+R` | Redo an overwrite |
+| `Ctrl+U` / `Ctrl+R` | Undo or redo a byte overwrite |
 | `Ctrl+S` | Save the edited binary |
 | Escape | Return to View Mode |
 
@@ -250,7 +254,8 @@ re:\x4D\x5A.{2}
 
 ## Fields and overlays
 
-Select a byte range and press `a` to create a named field. Fields support:
+Select a byte range and press `a` to create a named field. New field inputs are
+blank; leaving start and end blank keeps the current selection. Fields support:
 
 - editable start and end offsets;
 - a name and description;

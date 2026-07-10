@@ -59,6 +59,12 @@ pub struct PathDialog {
 }
 
 #[derive(Debug)]
+pub enum OpenFileDialog {
+    Choice { active: usize },
+    ManualPath { input: TextInput },
+}
+
+#[derive(Debug)]
 pub enum Mode {
     Normal,
     Search(TextInput),
@@ -89,6 +95,10 @@ impl TextInput {
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.value.clear();
             }
+            // Some terminals send Ctrl+H instead of Backspace.
+            KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.value.pop();
+            }
             KeyCode::Char(character)
                 if !key
                     .modifiers
@@ -116,13 +126,13 @@ pub struct FieldEditor {
 }
 
 impl FieldEditor {
-    fn new(selection: Selection, number: usize) -> Self {
+    fn new() -> Self {
         Self {
             editing: None,
-            name: format!("field_{number}"),
+            name: String::new(),
             description: String::new(),
-            start: format!("0x{:X}", selection.start()),
-            end: format!("0x{:X}", selection.end()),
+            start: String::new(),
+            end: String::new(),
             color: FieldColor::default(),
             active: 0,
         }
@@ -155,6 +165,10 @@ impl FieldEditor {
             return;
         };
         match key.code {
+            // Some terminals send Ctrl+H instead of Backspace.
+            KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                input.pop();
+            }
             KeyCode::Char(character)
                 if !key
                     .modifiers
@@ -314,6 +328,7 @@ pub struct App {
     undo_stack: Vec<EditAction>,
     redo_stack: Vec<EditAction>,
     pending_edit: Option<PendingEdit>,
+    vim_g_pending: bool,
     mouse_dragging: bool,
     scrollbar_dragging: Option<ScrollbarDrag>,
     quit_armed: bool,
@@ -349,6 +364,7 @@ impl App {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             pending_edit: None,
+            vim_g_pending: false,
             mouse_dragging: false,
             scrollbar_dragging: None,
             quit_armed: false,
@@ -374,6 +390,7 @@ pub struct Workspace {
     pub tab_hitboxes: Vec<(u16, u16)>,
     pub tab_row: u16,
     pub comparison_panes: Vec<Rect>,
+    pub open_file_dialog: Option<OpenFileDialog>,
     tab_switch_pending: bool,
 }
 
@@ -389,6 +406,7 @@ impl Workspace {
             tab_hitboxes: Vec::new(),
             tab_row: 0,
             comparison_panes: Vec::new(),
+            open_file_dialog: None,
             tab_switch_pending: false,
         }
     }
@@ -441,9 +459,13 @@ impl Workspace {
     }
 
     fn handle_workspace_key(&mut self, key: KeyEvent) -> io::Result<bool> {
+        if self.open_file_dialog.is_some() {
+            self.handle_open_file_dialog_key(key);
+            return Ok(false);
+        }
         if self.documents.is_empty() {
             if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('n') {
-                self.open_binary_picker();
+                self.open_file_dialog = Some(OpenFileDialog::Choice { active: 0 });
                 return Ok(false);
             }
             if key.code == KeyCode::Char('q') {
@@ -475,7 +497,7 @@ impl Workspace {
                 KeyCode::Char('n')
                     if !self.active().edit_mode && matches!(self.active().mode, Mode::Normal) =>
                 {
-                    self.open_binary_picker();
+                    self.open_file_dialog = Some(OpenFileDialog::Choice { active: 0 });
                     return Ok(false);
                 }
                 KeyCode::Char('d')
@@ -569,33 +591,65 @@ impl Workspace {
         self.status = format!("Active binary: {}", self.active().path.display());
     }
 
+    fn handle_open_file_dialog_key(&mut self, key: KeyEvent) {
+        let Some(dialog) = &mut self.open_file_dialog else {
+            return;
+        };
+        match dialog {
+            OpenFileDialog::Choice { active } => match key.code {
+                KeyCode::Esc => self.open_file_dialog = None,
+                KeyCode::Tab | KeyCode::Up | KeyCode::Down => *active = (*active + 1) % 2,
+                KeyCode::Enter if *active == 0 => self.open_binary_picker(),
+                KeyCode::Enter => {
+                    self.open_file_dialog = Some(OpenFileDialog::ManualPath {
+                        input: TextInput::default(),
+                    });
+                }
+                _ => {}
+            },
+            OpenFileDialog::ManualPath { input } => match key.code {
+                KeyCode::Esc => self.open_file_dialog = None,
+                KeyCode::Enter => {
+                    let path = PathBuf::from(input.value.trim());
+                    if path.as_os_str().is_empty() {
+                        self.status = "Enter a full or relative file path".into();
+                    } else if let Err(error) = self.open_binary_path(path) {
+                        self.status = error;
+                    } else {
+                        self.open_file_dialog = None;
+                    }
+                }
+                _ => input.handle_key(key),
+            },
+        }
+    }
+
     fn open_binary_picker(&mut self) {
         match pick_binary_file() {
-            Ok(Some(path)) => match fs::read(&path) {
-                Ok(bytes) => {
-                    self.documents.push(App::new(path.clone(), bytes));
-                    self.active = self.documents.len() - 1;
-                    if self.show_entropy {
-                        self.active_mut().entropy_profile();
-                    }
-                    self.status = format!("Opened {}", path.display());
-                }
-                Err(error) => {
-                    let message = format!("Could not open {}: {error}", path.display());
-                    self.status = message.clone();
-                    if let Some(document) = self.documents.get_mut(self.active) {
-                        document.status = message;
-                    }
-                }
+            Ok(Some(path)) => match self.open_binary_path(path) {
+                Ok(()) => self.open_file_dialog = None,
+                Err(error) => self.status = error,
             },
             Ok(None) => self.status = "Open cancelled".into(),
             Err(error) => {
-                self.status = error.clone();
-                if let Some(document) = self.documents.get_mut(self.active) {
-                    document.status = error;
-                }
+                self.status = format!("{error} Type a path manually instead.");
+                self.open_file_dialog = Some(OpenFileDialog::ManualPath {
+                    input: TextInput::default(),
+                });
             }
         }
+    }
+
+    fn open_binary_path(&mut self, path: PathBuf) -> Result<(), String> {
+        let bytes = fs::read(&path)
+            .map_err(|error| format!("Could not open {}: {error}", path.display()))?;
+        self.documents.push(App::new(path.clone(), bytes));
+        self.active = self.documents.len() - 1;
+        if self.show_entropy {
+            self.active_mut().entropy_profile();
+        }
+        self.status = format!("Opened {}", path.display());
+        Ok(())
     }
 
     #[cfg(unix)]
@@ -782,6 +836,13 @@ impl App {
     }
 
     fn handle_view_key(&mut self, key: KeyEvent) -> io::Result<bool> {
+        if self.vim_g_pending {
+            self.vim_g_pending = false;
+            if key.code == KeyCode::Char('g') {
+                self.select_offset(0, false);
+                return Ok(false);
+            }
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('f') => {
@@ -792,6 +853,9 @@ impl App {
                 KeyCode::Char('g') => self.mode = Mode::Jump(TextInput::default()),
                 KeyCode::Char('o') => self.open_path_dialog(PathAction::SaveOverlay),
                 KeyCode::Char('l') => self.open_path_dialog(PathAction::LoadOverlay),
+                KeyCode::Char('u') => self.undo_overwrite(),
+                KeyCode::Char('r') => self.redo_overwrite(),
+                KeyCode::Char('s') => self.open_path_dialog(PathAction::SaveBinary),
                 KeyCode::Up => self.previous_search_result(),
                 KeyCode::Down => self.next_search_result(),
                 _ => {}
@@ -825,10 +889,12 @@ impl App {
                     Focus::Fields | Focus::Python => Focus::Viewer,
                 };
             }
-            KeyCode::Char('a') => {
-                if let Some(selection) = self.selection {
-                    self.mode = Mode::Field(FieldEditor::new(selection, self.fields.len() + 1));
-                }
+            KeyCode::Char('a') if self.selection.is_some() => {
+                self.mode = Mode::Field(FieldEditor::new());
+            }
+            KeyCode::Char('g') => self.vim_g_pending = true,
+            KeyCode::Char('G') if !self.bytes.is_empty() => {
+                self.select_offset(self.bytes.len() - 1, false);
             }
             KeyCode::Enter if self.focus == Focus::Fields => self.edit_selected_field(),
             KeyCode::Char('d') if self.focus == Focus::Fields => self.delete_selected_field(),
@@ -1425,7 +1491,7 @@ impl App {
         self.pending_edit = None;
         self.entropy = None;
         self.rebuild_display_rows();
-        self.status = "Applied Python buffer; Ctrl+S in Overwrite Mode saves it".into();
+        self.status = "Applied Python buffer; Ctrl+S saves it".into();
     }
 
     fn handle_help_key(&mut self, key: KeyEvent) {
@@ -1853,19 +1919,25 @@ impl App {
         let Mode::Field(editor) = &self.mode else {
             return;
         };
-        let start = match parse_offset(&editor.start) {
-            Ok(value) => value,
-            Err(error) => {
-                self.status = format!("Invalid start: {error}");
-                return;
-            }
+        let start = match editor.start.trim() {
+            "" => self.selection.map_or(0, Selection::start),
+            input => match parse_offset(input) {
+                Ok(value) => value,
+                Err(error) => {
+                    self.status = format!("Invalid start: {error}");
+                    return;
+                }
+            },
         };
-        let end = match parse_offset(&editor.end) {
-            Ok(value) => value,
-            Err(error) => {
-                self.status = format!("Invalid end: {error}");
-                return;
-            }
+        let end = match editor.end.trim() {
+            "" => self.selection.map_or(0, Selection::end),
+            input => match parse_offset(input) {
+                Ok(value) => value,
+                Err(error) => {
+                    self.status = format!("Invalid end: {error}");
+                    return;
+                }
+            },
         };
         if self.bytes.is_empty() || start > end || end >= self.bytes.len() {
             self.status = "Field range must be ordered and inside the file".into();
@@ -2407,6 +2479,77 @@ mod tests {
     }
 
     #[test]
+    fn new_field_editor_starts_blank_and_uses_the_selection_range() {
+        let editor = FieldEditor::new();
+        assert!(editor.name.is_empty());
+        assert!(editor.description.is_empty());
+        assert!(editor.start.is_empty());
+        assert!(editor.end.is_empty());
+
+        let mut app = App::new("sample.bin".into(), vec![0; 16]);
+        app.selection = Some(Selection {
+            anchor: 3,
+            cursor: 8,
+        });
+        app.mode = Mode::Field(editor);
+        app.commit_field_editor();
+
+        assert_eq!(app.fields[0].name, "field_1");
+        assert_eq!((app.fields[0].start, app.fields[0].end), (3, 8));
+    }
+
+    #[test]
+    fn field_editor_accepts_ctrl_h_as_backspace() {
+        let mut editor = FieldEditor::new();
+        editor.name = "field".into();
+        editor.handle_text_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL));
+        assert_eq!(editor.name, "fiel");
+    }
+
+    #[test]
+    fn vim_navigation_jumps_to_file_boundaries() {
+        let mut app = App::new("sample.bin".into(), vec![0; 32]);
+        app.select_offset(12, false);
+        app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.selection.unwrap().cursor, 0);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT))
+            .unwrap();
+        assert_eq!(app.selection.unwrap().cursor, 31);
+    }
+
+    #[test]
+    fn open_binary_dialog_accepts_a_manually_typed_path() {
+        let path = temporary_file("manual-open.bin");
+        fs::write(&path, [0xCA, 0xFE]).unwrap();
+        let mut workspace = Workspace::new(Vec::new());
+        workspace
+            .handle_workspace_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL))
+            .unwrap();
+        workspace
+            .handle_workspace_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .unwrap();
+        workspace
+            .handle_workspace_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        let Some(OpenFileDialog::ManualPath { input }) = &mut workspace.open_file_dialog else {
+            panic!("manual path input should be open");
+        };
+        input.value = path.display().to_string();
+        workspace
+            .handle_workspace_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+
+        assert_eq!(workspace.documents.len(), 1);
+        assert_eq!(workspace.active().bytes.as_slice(), [0xCA, 0xFE]);
+        assert!(workspace.open_file_dialog.is_none());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn locates_search_highlights_with_sorted_results() {
         let mut app = App::new("sample.bin".into(), vec![0; 32]);
         app.search.results = vec![
@@ -2447,6 +2590,45 @@ mod tests {
         app.redo_overwrite();
         assert_eq!(app.bytes[0], 0x12);
         assert!(app.modified_offsets.contains(&0));
+    }
+
+    #[test]
+    fn view_mode_supports_undo_redo_and_save() {
+        let mut app = App::new("sample.bin".into(), vec![0xAB]);
+        app.overwrite_nibble(0x1);
+        app.overwrite_nibble(0x2);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL))
+            .unwrap();
+        assert_eq!(app.bytes[0], 0xAB);
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL))
+            .unwrap();
+        assert_eq!(app.bytes[0], 0x12);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
+            .unwrap();
+        assert!(matches!(
+            app.mode,
+            Mode::Path(PathDialog {
+                action: PathAction::SaveBinary,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn overwrite_mode_still_opens_the_save_dialog() {
+        let mut app = App::new("sample.bin".into(), vec![0xAB]);
+        app.edit_mode = true;
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
+            .unwrap();
+        assert!(matches!(
+            app.mode,
+            Mode::Path(PathDialog {
+                action: PathAction::SaveBinary,
+                ..
+            })
+        ));
     }
 
     #[test]
