@@ -8,10 +8,12 @@ use ratatui::{
         Sparkline, Wrap,
     },
 };
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::app::{
-    App, DisplayRow, FieldEditor, Focus, HelpViewer, Mode, OpenFileDialog, PathAction, PathDialog,
-    PythonPane, ResetTarget, SettingsEditor, ThemeEditor, Workspace,
+    App, DisplayRow, FieldEditor, Focus, HelpViewer, Mode, OpenFileDialog,
+    PATH_SUGGESTION_PAGE_SIZE, PathAction, PathDialog, PythonPane, ResetTarget, SettingsEditor,
+    ThemeEditor, Workspace,
 };
 
 pub fn render_workspace(frame: &mut Frame, workspace: &mut Workspace) {
@@ -127,13 +129,13 @@ fn render_mode_modal(frame: &mut Frame, app: &App) {
         Mode::Search(input) => render_input_modal(
             frame,
             " Search bytes ",
-            &input.value,
+            input,
             "Hex (DE AD/0xDEAD), dec:, bin:, or re: | Enter search | n/N matches",
         ),
         Mode::Jump(input) => render_input_modal(
             frame,
             " Jump to offset ",
-            &input.value,
+            input,
             "Enter decimal or 0x-prefixed hexadecimal offset",
         ),
         Mode::Field(editor) => render_field_modal(frame, editor),
@@ -239,7 +241,7 @@ fn render_comparison(frame: &mut Frame, workspace: &mut Workspace, area: Rect) {
         render_viewer(frame, document, *pane, Some(&name), diff_reference);
     }
     let help = format!(
-        "Ctrl+B then Left/Right switch, S comparison | Ctrl+N open | Ctrl+D diff | Ctrl+F search | e entropy | ? keybinds | {}",
+        "Ctrl+B then Left/Right switch, S comparison | Ctrl+N open | Ctrl+W close | Ctrl+D diff | Ctrl+F search | e entropy | ? keybinds | {}",
         workspace.status
     );
     frame.render_widget(
@@ -456,7 +458,9 @@ fn byte_style_with_diff(
 fn byte_style(app: &App, offset: usize, byte: u8, ascii: bool) -> Style {
     let mut style = Style::default().fg(app.theme_color_for_byte(offset, byte, ascii).color());
 
-    if let Some(field) = app.fields.iter().find(|field| field.contains(offset)) {
+    if app.settings.show_overlays
+        && let Some(field) = app.fields.iter().find(|field| field.contains(offset))
+    {
         style = style
             .fg(field.color.color())
             .add_modifier(Modifier::UNDERLINED);
@@ -566,6 +570,11 @@ fn inspector_lines(app: &App) -> Vec<Line<'static>> {
         .map(|byte| format!("{byte:02X}"))
         .collect::<Vec<_>>()
         .join(" ");
+    let decimal = preview
+        .iter()
+        .map(u8::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
     let ascii: String = preview
         .iter()
         .map(|byte| {
@@ -586,10 +595,16 @@ fn inspector_lines(app: &App) -> Vec<Line<'static>> {
     let mut lines = vec![
         kv(
             "Range",
-            format!("0x{:X}..=0x{:X}", selection.start(), selection.end()),
+            format!(
+                "0x{:X} to 0x{:X} ({} to {})",
+                selection.start(),
+                selection.end(),
+                selection.start(),
+                selection.end()
+            ),
         ),
         kv("Length", format!("{} bytes", selection.len())),
-        kv("Hex", hex),
+        kv("Selected", format!("0x{hex} ({decimal})")),
         kv("ASCII", ascii),
         kv("Binary", binary),
     ];
@@ -750,13 +765,13 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(vec![first, second, third]), area);
 }
 
-fn render_input_modal(frame: &mut Frame, title: &str, value: &str, help: &str) {
+fn render_input_modal(frame: &mut Frame, title: &str, input: &crate::app::TextInput, help: &str) {
     let area = centered_rect(frame.area(), 78, 7);
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(vec![
             Line::from(""),
-            input_line(value),
+            input_line(input),
             Line::from(""),
             Line::styled(help, Style::default().fg(Color::DarkGray)),
         ])
@@ -787,7 +802,7 @@ fn render_path_modal(frame: &mut Frame, dialog: &PathDialog) {
         PathAction::SaveTheme => (" Save theme ", "Save this custom theme as JSON."),
         PathAction::LoadTheme => (" Load theme ", "Enter the path to a theme JSON file."),
     };
-    render_input_modal(frame, title, &dialog.input.value, help);
+    render_input_modal(frame, title, &dialog.input, help);
 }
 
 fn render_open_file_modal(frame: &mut Frame, dialog: &OpenFileDialog) {
@@ -823,50 +838,178 @@ fn render_open_file_modal(frame: &mut Frame, dialog: &OpenFileDialog) {
                 area,
             );
         }
-        OpenFileDialog::ManualPath { input } => render_input_modal(
+        OpenFileDialog::ManualPath {
+            input,
+            suggestions,
+            active_suggestion,
+            suggestion_scroll,
+        } => render_manual_path_modal(
             frame,
-            " Open binary by path ",
-            &input.value,
-            "Enter a full or relative path | Enter open | Esc cancel",
+            input,
+            suggestions,
+            *active_suggestion,
+            *suggestion_scroll,
         ),
     }
 }
 
-fn input_line(value: &str) -> Line<'static> {
-    Line::styled(
-        format!(" {value}"),
+fn render_manual_path_modal(
+    frame: &mut Frame,
+    input: &crate::app::TextInput,
+    suggestions: &[std::path::PathBuf],
+    active_suggestion: Option<usize>,
+    suggestion_scroll: usize,
+) {
+    let suggestion_lines = suggestions.len().min(PATH_SUGGESTION_PAGE_SIZE) as u16;
+    let area = centered_rect(frame.area(), 78, 7 + suggestion_lines);
+    frame.render_widget(Clear, area);
+    let mut lines = vec![Line::from(""), input_line(input)];
+    if !suggestions.is_empty() {
+        lines.push(Line::from(""));
+        lines.extend(
+            suggestions
+                .iter()
+                .enumerate()
+                .skip(suggestion_scroll)
+                .take(PATH_SUGGESTION_PAGE_SIZE)
+                .map(|(index, path)| {
+                    let (kind, name) = if path.is_dir() {
+                        (
+                            "[DIR] ",
+                            format!(
+                                "{}/",
+                                path.file_name()
+                                    .and_then(|name| name.to_str())
+                                    .unwrap_or("directory")
+                            ),
+                        )
+                    } else {
+                        (
+                            "[FILE]",
+                            path.file_name()
+                                .and_then(|name| name.to_str())
+                                .unwrap_or("file")
+                                .to_owned(),
+                        )
+                    };
+                    Line::styled(
+                        format!(
+                            " {} {kind} {name}",
+                            if Some(index) == active_suggestion {
+                                ">"
+                            } else {
+                                " "
+                            },
+                        ),
+                        selected_row(Some(index) == active_suggestion),
+                    )
+                }),
+        );
+    }
+    lines.extend([
+        Line::from(""),
+        Line::styled(
+            "Tab/Up/Down select | PgUp/PgDn scroll | Enter open | mouse wheel scroll",
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]);
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .title(Span::styled(" Open binary by path ", modal_title_style()))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+        ),
+        area,
+    );
+}
+
+fn input_line(input: &crate::app::TextInput) -> Line<'static> {
+    let style = if input.selected {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::White)
+            .add_modifier(Modifier::BOLD)
+    } else {
         Style::default()
             .fg(Color::White)
             .bg(Color::DarkGray)
-            .add_modifier(Modifier::BOLD),
+            .add_modifier(Modifier::BOLD)
+    };
+    let mut spans = vec![Span::styled(" ", style)];
+    spans.extend(editable_spans(input, style, true));
+    Line::from(spans)
+}
+
+fn cursor_is_visible() -> bool {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .div_euclid(500)
+        .is_multiple_of(2)
+}
+
+fn editable_spans(input: &crate::app::TextInput, style: Style, active: bool) -> Vec<Span<'static>> {
+    caret_spans(
+        &input.value,
+        input.cursor_byte_index(),
+        style,
+        active && cursor_is_visible(),
     )
+}
+
+fn caret_spans(value: &str, cursor: usize, style: Style, show_caret: bool) -> Vec<Span<'static>> {
+    let cursor = cursor.min(value.len());
+    let mut spans = vec![Span::styled(value[..cursor].to_owned(), style)];
+    if show_caret {
+        spans.push(Span::styled(
+            "▏",
+            Style::default().fg(Color::Black).bg(Color::Yellow),
+        ));
+    }
+    spans.push(Span::styled(value[cursor..].to_owned(), style));
+    spans
 }
 
 fn render_field_modal(frame: &mut Frame, editor: &FieldEditor) {
     let area = centered_rect(frame.area(), 72, 13);
     frame.render_widget(Clear, area);
-    let rows = [
-        ("Name", editor.name.as_str()),
-        ("Description", editor.description.as_str()),
-        ("Start", editor.start.as_str()),
-        ("End", editor.end.as_str()),
-        ("Color", editor.color.name()),
+    let text_rows = [
+        ("Name", &editor.name),
+        ("Description", &editor.description),
+        ("Start", &editor.start),
+        ("End", &editor.end),
     ];
-    let lines = rows
+    let mut lines = text_rows
         .iter()
         .enumerate()
-        .map(|(index, (label, value))| {
-            let style = selected_row(index == editor.active);
-            Line::styled(format!(" {label:<12} {value}"), style)
+        .map(|(index, (label, input))| {
+            let active = index == editor.active;
+            let style = if active && input.selected {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::White)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                selected_row(active)
+            };
+            let mut spans = vec![Span::styled(format!(" {label:<12} "), style)];
+            spans.extend(editable_spans(input, style, active));
+            Line::from(spans)
         })
-        .chain([
-            Line::from(""),
-            Line::styled(
-                "Tab/Up/Down field | Backspace/Ctrl+H erase | Enter save | Esc cancel",
-                Style::default().fg(Color::DarkGray),
-            ),
-        ])
         .collect::<Vec<_>>();
+    lines.push(Line::styled(
+        format!(" {:<12} {}", "Color", editor.color.name()),
+        selected_row(editor.active == 4),
+    ));
+    lines.extend([
+        Line::from(""),
+        Line::styled(
+            "Tab/Up/Down field | Backspace/Ctrl+H erase | Enter save | Esc cancel",
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]);
     let title = if editor.editing.is_some() {
         " Edit field "
     } else {
@@ -902,10 +1045,20 @@ fn render_theme_modal(frame: &mut Frame, app: &App, editor: &ThemeEditor) {
         .iter()
         .enumerate()
         .map(|(index, (label, value))| {
-            Line::styled(
-                format!(" {label:<17} {value}"),
-                selected_row(index == editor.active),
-            )
+            let active = index == editor.active;
+            let style = selected_row(active);
+            if index == 0 {
+                let mut spans = vec![Span::styled(format!(" {label:<17} "), style)];
+                spans.extend(caret_spans(
+                    value,
+                    value.len(),
+                    style,
+                    active && cursor_is_visible(),
+                ));
+                Line::from(spans)
+            } else {
+                Line::styled(format!(" {label:<17} {value}"), style)
+            }
         })
         .collect::<Vec<_>>();
     lines.extend([
@@ -927,7 +1080,7 @@ fn render_theme_modal(frame: &mut Frame, app: &App, editor: &ThemeEditor) {
 }
 
 fn render_settings_modal(frame: &mut Frame, app: &App, editor: &SettingsEditor) {
-    let area = centered_rect(frame.area(), 70, 14);
+    let area = centered_rect(frame.area(), 70, 15);
     frame.render_widget(Clear, area);
     let enabled = |value| if value { "enabled" } else { "disabled" };
     let rows = [
@@ -945,6 +1098,10 @@ fn render_settings_modal(frame: &mut Frame, app: &App, editor: &SettingsEditor) 
         (
             "Compress repeated rows",
             enabled(app.settings.compress_repeated_rows).to_string(),
+        ),
+        (
+            "Field overlays",
+            enabled(app.settings.show_overlays).to_string(),
         ),
     ];
     let mut lines = rows
@@ -1013,18 +1170,19 @@ fn render_python_pane(frame: &mut Frame, pane: &PythonPane, area: Rect, active: 
         .map(|line| Line::raw(line.clone()))
         .collect::<Vec<_>>();
     lines.push(Line::from(""));
-    lines.push(Line::from(vec![
-        Span::styled(">>> ", Style::default().fg(Color::LightGreen)),
-        Span::raw(&pane.input.value),
-        if pane.pending > 0 {
-            Span::styled(
-                format!("  [{} running]", pane.pending),
-                Style::default().fg(Color::Yellow),
-            )
-        } else {
-            Span::raw("")
-        },
-    ]));
+    let mut input_spans = vec![Span::styled(">>> ", Style::default().fg(Color::LightGreen))];
+    input_spans.extend(editable_spans(
+        &pane.input,
+        Style::default().fg(Color::White),
+        active,
+    ));
+    if pane.pending > 0 {
+        input_spans.push(Span::styled(
+            format!("  [{} running]", pane.pending),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    lines.push(Line::from(input_spans));
     frame.render_widget(
         Paragraph::new(lines).wrap(Wrap { trim: false }).block(
             Block::default()
@@ -1154,6 +1312,7 @@ fn keybinding_lines() -> Vec<Line<'static>> {
         binding("Ctrl+B, then Left", "activate the previous binary"),
         binding("Ctrl+B, then S", "toggle side-by-side comparison"),
         binding("Ctrl+N", "choose system picker or type a binary path"),
+        binding("Ctrl+W", "close the active binary (twice if unsaved)"),
         binding("Ctrl+D", "toggle byte diff mode"),
         binding("Ctrl+Z", "suspend on Unix; resume with shell fg"),
         binding("e", "toggle the active binary's entropy graph"),
@@ -1175,7 +1334,7 @@ fn keybinding_lines() -> Vec<Line<'static>> {
         binding("Ctrl+Down / Ctrl+Up", "next / previous search result"),
         binding("Ctrl+G", "jump to a decimal or hexadecimal offset"),
         binding(
-            "Ctrl+Shift+C",
+            "Ctrl+C / Ctrl+Shift+C",
             "copy the selection as continuous hexadecimal",
         ),
         binding("Ctrl+U / Ctrl+R", "undo / redo byte overwrites"),
@@ -1186,6 +1345,7 @@ fn keybinding_lines() -> Vec<Line<'static>> {
         binding("d", "delete the selected field"),
         binding("[ / ]", "select previous / next field"),
         binding("Ctrl+O / Ctrl+L", "save / load a field overlay"),
+        binding("o", "toggle field overlays"),
         binding("s", "open viewer settings"),
         binding("t", "open theme customization"),
         binding("p", "open the Python buffer console"),
@@ -1383,6 +1543,36 @@ mod tests {
         assert!(rendered.contains("Hex Viewer - View Mode"));
         assert!(rendered.contains("Inspector"));
         assert!(rendered.contains("Fields"));
+    }
+
+    #[test]
+    fn inspector_includes_prefixed_hex_and_decimal_selection_details() {
+        let mut app = App::new(PathBuf::from("sample.bin"), vec![0, 0xDE, 0xAD]);
+        app.selection = Some(crate::model::Selection {
+            anchor: 1,
+            cursor: 2,
+        });
+        let rendered = inspector_lines(&app)
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("0x1 to 0x2 (1 to 2)"));
+        assert!(rendered.contains("0xDE AD (222, 173)"));
+    }
+
+    #[test]
+    fn caret_is_inserted_at_the_current_text_position() {
+        let rendered = caret_spans("abcd", 2, Style::default(), true)
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert_eq!(rendered, "ab▏cd");
     }
 
     #[test]

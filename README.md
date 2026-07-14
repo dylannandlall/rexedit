@@ -182,7 +182,8 @@ reference.
 | `Ctrl+B`, then Right | Activate the next binary |
 | `Ctrl+B`, then Left | Activate the previous binary |
 | `Ctrl+B`, then `S` | Toggle side-by-side comparison |
-| `Ctrl+N` | Choose the system file picker or type a full or relative path |
+| `Ctrl+N` | Choose the system file picker or type a full or relative path; Tab lists and cycles matches, while arrows/Page Up/Page Down or the mouse wheel navigate all suggestions |
+| `Ctrl+W` | Close the active binary (press again to discard unsaved byte changes) |
 | `Ctrl+D` | Toggle byte-difference highlighting |
 | `e` | Toggle the active binary's entropy graph |
 | Mouse click on a tab or pane | Activate that binary |
@@ -204,7 +205,7 @@ aligned.
 | `Ctrl+F` | Search the binary |
 | `n` / `N` | Next or previous search result |
 | `Ctrl+G` | Jump to an offset |
-| `Ctrl+Shift+C` | Copy the selection as continuous hexadecimal (for example, `DEADBEEF`) |
+| `Ctrl+C` / `Ctrl+Shift+C` | Copy the selection as continuous hexadecimal (for example, `DEADBEEF`) |
 | `Ctrl+U` / `Ctrl+R` | Undo or redo a byte overwrite |
 | `Ctrl+S` | Save the edited binary |
 | `a` | Create a field from the selection |
@@ -212,6 +213,7 @@ aligned.
 | `Enter` | Edit the selected field |
 | `d` | Delete the selected field |
 | `Ctrl+O` / `Ctrl+L` | Save or load an overlay |
+| `o` | Toggle field overlays |
 | `p` | Open the Python buffer console |
 | `s` | Open viewer settings |
 | `t` | Open theme customization |
