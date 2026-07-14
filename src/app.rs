@@ -11,6 +11,9 @@ use std::{
 #[cfg(windows)]
 use std::{io::Write, process::Stdio};
 
+#[cfg(not(windows))]
+use std::{io::Write, process::Stdio};
+
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
@@ -56,6 +59,8 @@ pub enum PathAction {
     LoadTheme,
 }
 
+pub const PATH_SUGGESTION_PAGE_SIZE: usize = 12;
+
 #[derive(Debug)]
 pub struct PathDialog {
     pub action: PathAction,
@@ -64,8 +69,15 @@ pub struct PathDialog {
 
 #[derive(Debug)]
 pub enum OpenFileDialog {
-    Choice { active: usize },
-    ManualPath { input: TextInput },
+    Choice {
+        active: usize,
+    },
+    ManualPath {
+        input: TextInput,
+        suggestions: Vec<PathBuf>,
+        active_suggestion: Option<usize>,
+        suggestion_scroll: usize,
+    },
 }
 
 #[derive(Debug)]
@@ -88,32 +100,123 @@ pub enum ResetTarget {
     Settings,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct TextInput {
     pub value: String,
+    cursor: usize,
+    pub selected: bool,
 }
 
 impl TextInput {
+    fn with_value(value: String) -> Self {
+        let cursor = value.chars().count();
+        Self {
+            value,
+            cursor,
+            selected: true,
+        }
+    }
+
+    fn clear_selection(&mut self) {
+        self.selected = false;
+    }
+
+    fn set_value(&mut self, value: String) {
+        self.cursor = value.chars().count();
+        self.value = value;
+        self.selected = false;
+    }
+
+    fn take_value(&mut self) -> String {
+        self.cursor = 0;
+        self.selected = false;
+        std::mem::take(&mut self.value)
+    }
+
+    fn replace_selection(&mut self) {
+        if self.selected {
+            self.value.clear();
+            self.cursor = 0;
+            self.selected = false;
+        }
+    }
+
+    fn byte_index(&self, character_index: usize) -> usize {
+        self.value
+            .char_indices()
+            .nth(character_index)
+            .map_or(self.value.len(), |(index, _)| index)
+    }
+
+    pub fn cursor_byte_index(&self) -> usize {
+        self.byte_index(self.cursor)
+    }
+
     fn handle_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.value.clear();
+                self.cursor = 0;
+                self.selected = false;
             }
             // Some terminals send Ctrl+H instead of Backspace.
             KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.value.pop();
+                self.backspace();
             }
             KeyCode::Char(character)
                 if !key
                     .modifiers
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
-                self.value.push(character);
+                self.replace_selection();
+                let index = self.byte_index(self.cursor);
+                self.value.insert(index, character);
+                self.cursor += 1;
             }
             KeyCode::Backspace => {
-                self.value.pop();
+                self.backspace();
+            }
+            KeyCode::Left => {
+                self.cursor = self.cursor.saturating_sub(1);
+                self.selected = false;
+            }
+            KeyCode::Right => {
+                self.cursor = (self.cursor + 1).min(self.value.chars().count());
+                self.selected = false;
+            }
+            KeyCode::Home => {
+                self.cursor = 0;
+                self.selected = false;
+            }
+            KeyCode::End => {
+                self.cursor = self.value.chars().count();
+                self.selected = false;
             }
             _ => {}
+        }
+    }
+
+    fn backspace(&mut self) {
+        if self.selected {
+            self.replace_selection();
+            return;
+        }
+        if self.cursor == 0 {
+            return;
+        }
+        let start = self.byte_index(self.cursor - 1);
+        let end = self.byte_index(self.cursor);
+        self.value.replace_range(start..end, "");
+        self.cursor -= 1;
+    }
+}
+
+impl Default for TextInput {
+    fn default() -> Self {
+        Self {
+            value: String::new(),
+            cursor: 0,
+            selected: false,
         }
     }
 }
@@ -121,10 +224,10 @@ impl TextInput {
 #[derive(Debug)]
 pub struct FieldEditor {
     pub editing: Option<usize>,
-    pub name: String,
-    pub description: String,
-    pub start: String,
-    pub end: String,
+    pub name: TextInput,
+    pub description: TextInput,
+    pub start: TextInput,
+    pub end: TextInput,
     pub color: FieldColor,
     pub active: usize,
 }
@@ -133,10 +236,10 @@ impl FieldEditor {
     fn new() -> Self {
         Self {
             editing: None,
-            name: String::new(),
-            description: String::new(),
-            start: String::new(),
-            end: String::new(),
+            name: TextInput::default(),
+            description: TextInput::default(),
+            start: TextInput::default(),
+            end: TextInput::default(),
             color: FieldColor::default(),
             active: 0,
         }
@@ -145,16 +248,16 @@ impl FieldEditor {
     fn from_field(index: usize, field: &Field) -> Self {
         Self {
             editing: Some(index),
-            name: field.name.clone(),
-            description: field.description.clone(),
-            start: format!("0x{:X}", field.start),
-            end: format!("0x{:X}", field.end),
+            name: TextInput::with_value(field.name.clone()),
+            description: TextInput::with_value(field.description.clone()),
+            start: TextInput::with_value(format!("0x{:X}", field.start)),
+            end: TextInput::with_value(format!("0x{:X}", field.end)),
             color: field.color,
             active: 0,
         }
     }
 
-    fn active_text_mut(&mut self) -> Option<&mut String> {
+    fn active_text_mut(&mut self) -> Option<&mut TextInput> {
         match self.active {
             0 => Some(&mut self.name),
             1 => Some(&mut self.description),
@@ -168,23 +271,7 @@ impl FieldEditor {
         let Some(input) = self.active_text_mut() else {
             return;
         };
-        match key.code {
-            // Some terminals send Ctrl+H instead of Backspace.
-            KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                input.pop();
-            }
-            KeyCode::Char(character)
-                if !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-            {
-                input.push(character);
-            }
-            KeyCode::Backspace => {
-                input.pop();
-            }
-            _ => {}
-        }
+        input.handle_key(key);
     }
 }
 
@@ -234,6 +321,7 @@ pub struct ViewerSettings {
     pub show_offsets: bool,
     pub show_sidebar: bool,
     pub compress_repeated_rows: bool,
+    pub show_overlays: bool,
 }
 
 impl Default for ViewerSettings {
@@ -245,6 +333,7 @@ impl Default for ViewerSettings {
             show_offsets: true,
             show_sidebar: true,
             compress_repeated_rows: false,
+            show_overlays: true,
         }
     }
 }
@@ -504,6 +593,12 @@ impl Workspace {
                     self.open_file_dialog = Some(OpenFileDialog::Choice { active: 0 });
                     return Ok(false);
                 }
+                KeyCode::Char('w')
+                    if !self.active().edit_mode && matches!(self.active().mode, Mode::Normal) =>
+                {
+                    self.close_active_document();
+                    return Ok(false);
+                }
                 KeyCode::Char('d')
                     if !self.active().edit_mode && matches!(self.active().mode, Mode::Normal) =>
                 {
@@ -532,6 +627,29 @@ impl Workspace {
     }
 
     pub(crate) fn handle_workspace_mouse(&mut self, mouse: MouseEvent) {
+        if let Some(OpenFileDialog::ManualPath {
+            input,
+            suggestions,
+            suggestion_scroll,
+            ..
+        }) = &mut self.open_file_dialog
+        {
+            match mouse.kind {
+                MouseEventKind::Down(MouseButton::Left) => input.clear_selection(),
+                MouseEventKind::ScrollUp => {
+                    *suggestion_scroll = suggestion_scroll.saturating_sub(3);
+                }
+                MouseEventKind::ScrollDown => {
+                    let max_scroll = suggestions.len().saturating_sub(PATH_SUGGESTION_PAGE_SIZE);
+                    *suggestion_scroll = suggestion_scroll.saturating_add(3).min(max_scroll);
+                }
+                _ => {}
+            }
+            return;
+        }
+        if self.open_file_dialog.is_some() {
+            return;
+        }
         if self.documents.is_empty() {
             return;
         }
@@ -607,13 +725,78 @@ impl Workspace {
                 KeyCode::Enter => {
                     self.open_file_dialog = Some(OpenFileDialog::ManualPath {
                         input: TextInput::default(),
+                        suggestions: Vec::new(),
+                        active_suggestion: None,
+                        suggestion_scroll: 0,
                     });
                 }
                 _ => {}
             },
-            OpenFileDialog::ManualPath { input } => match key.code {
+            OpenFileDialog::ManualPath {
+                input,
+                suggestions,
+                active_suggestion,
+                suggestion_scroll,
+            } => match key.code {
                 KeyCode::Esc => self.open_file_dialog = None,
+                KeyCode::Tab => Self::complete_manual_path(
+                    input,
+                    suggestions,
+                    active_suggestion,
+                    suggestion_scroll,
+                ),
+                KeyCode::Down if !suggestions.is_empty() => Self::move_suggestion(
+                    input,
+                    suggestions,
+                    active_suggestion,
+                    suggestion_scroll,
+                    1,
+                ),
+                KeyCode::Up if !suggestions.is_empty() => Self::move_suggestion(
+                    input,
+                    suggestions,
+                    active_suggestion,
+                    suggestion_scroll,
+                    -1,
+                ),
+                KeyCode::PageDown if !suggestions.is_empty() => Self::move_suggestion(
+                    input,
+                    suggestions,
+                    active_suggestion,
+                    suggestion_scroll,
+                    PATH_SUGGESTION_PAGE_SIZE as isize,
+                ),
+                KeyCode::PageUp if !suggestions.is_empty() => Self::move_suggestion(
+                    input,
+                    suggestions,
+                    active_suggestion,
+                    suggestion_scroll,
+                    -(PATH_SUGGESTION_PAGE_SIZE as isize),
+                ),
+                KeyCode::Home if !suggestions.is_empty() => Self::select_suggestion(
+                    input,
+                    suggestions,
+                    active_suggestion,
+                    suggestion_scroll,
+                    0,
+                ),
+                KeyCode::End if !suggestions.is_empty() => Self::select_suggestion(
+                    input,
+                    suggestions,
+                    active_suggestion,
+                    suggestion_scroll,
+                    suggestions.len() - 1,
+                ),
                 KeyCode::Enter => {
+                    if let Some(index) = *active_suggestion
+                        && suggestions[index].is_dir()
+                    {
+                        input.set_value(completion_display_path(&suggestions[index]));
+                        suggestions.clear();
+                        *active_suggestion = None;
+                        *suggestion_scroll = 0;
+                        return;
+                    }
                     let path = PathBuf::from(input.value.trim());
                     if path.as_os_str().is_empty() {
                         self.status = "Enter a full or relative file path".into();
@@ -623,7 +806,12 @@ impl Workspace {
                         self.open_file_dialog = None;
                     }
                 }
-                _ => input.handle_key(key),
+                _ => {
+                    input.handle_key(key);
+                    suggestions.clear();
+                    *active_suggestion = None;
+                    *suggestion_scroll = 0;
+                }
             },
         }
     }
@@ -639,9 +827,118 @@ impl Workspace {
                 self.status = format!("{error} Type a path manually instead.");
                 self.open_file_dialog = Some(OpenFileDialog::ManualPath {
                     input: TextInput::default(),
+                    suggestions: Vec::new(),
+                    active_suggestion: None,
+                    suggestion_scroll: 0,
                 });
             }
         }
+    }
+
+    fn complete_manual_path(
+        input: &mut TextInput,
+        suggestions: &mut Vec<PathBuf>,
+        active_suggestion: &mut Option<usize>,
+        suggestion_scroll: &mut usize,
+    ) {
+        if !suggestions.is_empty() {
+            let next = active_suggestion
+                .map(|index| (index + 1) % suggestions.len())
+                .unwrap_or(0);
+            Self::select_suggestion(
+                input,
+                suggestions,
+                active_suggestion,
+                suggestion_scroll,
+                next,
+            );
+            return;
+        }
+        let candidates = path_completion_candidates(&input.value);
+        if candidates.is_empty() {
+            *active_suggestion = None;
+            *suggestion_scroll = 0;
+            return;
+        }
+        if candidates.len() == 1 {
+            let path = completion_display_path(&candidates[0]);
+            input.set_value(path);
+            suggestions.clear();
+            *active_suggestion = None;
+            *suggestion_scroll = 0;
+            return;
+        }
+        *suggestions = candidates;
+        *active_suggestion = None;
+        *suggestion_scroll = 0;
+    }
+
+    fn move_suggestion(
+        input: &mut TextInput,
+        suggestions: &[PathBuf],
+        active_suggestion: &mut Option<usize>,
+        suggestion_scroll: &mut usize,
+        delta: isize,
+    ) {
+        let current = active_suggestion.unwrap_or(if delta.is_negative() {
+            suggestions.len() - 1
+        } else {
+            0
+        });
+        let next = current
+            .saturating_add_signed(delta)
+            .min(suggestions.len() - 1);
+        Self::select_suggestion(
+            input,
+            suggestions,
+            active_suggestion,
+            suggestion_scroll,
+            next,
+        );
+    }
+
+    fn select_suggestion(
+        input: &mut TextInput,
+        suggestions: &[PathBuf],
+        active_suggestion: &mut Option<usize>,
+        suggestion_scroll: &mut usize,
+        index: usize,
+    ) {
+        *active_suggestion = Some(index);
+        input.set_value(completion_display_path(&suggestions[index]));
+        if index < *suggestion_scroll {
+            *suggestion_scroll = index;
+        } else if index >= suggestion_scroll.saturating_add(PATH_SUGGESTION_PAGE_SIZE) {
+            *suggestion_scroll = index + 1 - PATH_SUGGESTION_PAGE_SIZE;
+        }
+    }
+
+    fn close_active_document(&mut self) {
+        if self.documents.is_empty() {
+            return;
+        }
+        let app = self.active();
+        if !app.modified_offsets.is_empty() && !app.quit_armed {
+            self.active_mut().quit_armed = true;
+            self.status = "Unsaved byte changes: press Ctrl+W again to close without saving".into();
+            return;
+        }
+        let path = self.documents.remove(self.active).path;
+        if self.documents.is_empty() {
+            self.active = 0;
+            self.side_by_side = false;
+            self.diff_mode = false;
+            self.comparison_panes.clear();
+            self.status = format!("Closed {}; Ctrl+N opens a file", path.display());
+            return;
+        }
+        self.active = self.active.min(self.documents.len() - 1);
+        if self.documents.len() < 2 {
+            self.side_by_side = false;
+            self.diff_mode = false;
+            self.comparison_panes.clear();
+        }
+        self.status = format!("Closed {}", path.display());
     }
 
     fn open_binary_path(&mut self, path: PathBuf) -> Result<(), String> {
@@ -850,9 +1147,7 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('f') => {
-                    self.mode = Mode::Search(TextInput {
-                        value: self.search.query.clone(),
-                    });
+                    self.mode = Mode::Search(TextInput::with_value(self.search.query.clone()));
                 }
                 KeyCode::Char('g') => self.mode = Mode::Jump(TextInput::default()),
                 KeyCode::Char('o') => self.open_path_dialog(PathAction::SaveOverlay),
@@ -860,9 +1155,7 @@ impl App {
                 KeyCode::Char('u') => self.undo_overwrite(),
                 KeyCode::Char('r') => self.redo_overwrite(),
                 KeyCode::Char('s') => self.open_path_dialog(PathAction::SaveBinary),
-                KeyCode::Char('c' | 'C') if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                    self.copy_selection_as_hex()
-                }
+                KeyCode::Char('c' | 'C') => self.copy_selection_as_hex(),
                 KeyCode::Up => self.previous_search_result(),
                 KeyCode::Down => self.next_search_result(),
                 _ => {}
@@ -888,6 +1181,15 @@ impl App {
             KeyCode::Char('t') => self.mode = Mode::Theme(ThemeEditor::default()),
             KeyCode::Char('s') => self.mode = Mode::Settings(SettingsEditor::default()),
             KeyCode::Char('p') => self.open_python_pane(),
+            KeyCode::Char('o') => {
+                self.settings.show_overlays = !self.settings.show_overlays;
+                self.status = if self.settings.show_overlays {
+                    "Field overlays enabled"
+                } else {
+                    "Field overlays hidden"
+                }
+                .into();
+            }
             KeyCode::Char('n') => self.next_search_result(),
             KeyCode::Char('N') => self.previous_search_result(),
             KeyCode::Tab => {
@@ -954,9 +1256,7 @@ impl App {
                     self.commit_pending_edit();
                     self.open_path_dialog(PathAction::SaveBinary);
                 }
-                KeyCode::Char('c' | 'C') if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                    self.copy_selection_as_hex()
-                }
+                KeyCode::Char('c' | 'C') => self.copy_selection_as_hex(),
                 _ => {}
             }
             return Ok(false);
@@ -1086,11 +1386,17 @@ impl App {
             KeyCode::Tab | KeyCode::Down => {
                 if let Mode::Field(editor) = &mut self.mode {
                     editor.active = (editor.active + 1) % 5;
+                    if let Some(input) = editor.active_text_mut() {
+                        input.selected = !input.value.is_empty();
+                    }
                 }
             }
             KeyCode::BackTab | KeyCode::Up => {
                 if let Mode::Field(editor) = &mut self.mode {
                     editor.active = editor.active.checked_sub(1).unwrap_or(4);
+                    if let Some(input) = editor.active_text_mut() {
+                        input.selected = !input.value.is_empty();
+                    }
                 }
             }
             KeyCode::Left | KeyCode::Right => {
@@ -1098,6 +1404,8 @@ impl App {
                     && editor.active == 4
                 {
                     editor.color = editor.color.next();
+                } else if let Mode::Field(editor) = &mut self.mode {
+                    editor.handle_text_key(key);
                 }
             }
             KeyCode::Enter => self.commit_field_editor(),
@@ -1177,12 +1485,12 @@ impl App {
             KeyCode::Esc | KeyCode::Enter => self.mode = Mode::Normal,
             KeyCode::Tab | KeyCode::Down => {
                 if let Mode::Settings(editor) = &mut self.mode {
-                    editor.active = (editor.active + 1) % 6;
+                    editor.active = (editor.active + 1) % 7;
                 }
             }
             KeyCode::BackTab | KeyCode::Up => {
                 if let Mode::Settings(editor) = &mut self.mode {
-                    editor.active = editor.active.checked_sub(1).unwrap_or(5);
+                    editor.active = editor.active.checked_sub(1).unwrap_or(6);
                 }
             }
             KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') => {
@@ -1344,7 +1652,7 @@ impl App {
         }
         if key.code == KeyCode::Enter {
             let command = match &mut self.mode {
-                Mode::Python(pane) => std::mem::take(&mut pane.input.value),
+                Mode::Python(pane) => pane.input.take_value(),
                 _ => return,
             };
             if command.trim().is_empty() {
@@ -1531,6 +1839,18 @@ impl App {
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) {
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            match &mut self.mode {
+                Mode::Search(input) | Mode::Jump(input) => input.clear_selection(),
+                Mode::Field(editor) => {
+                    if let Some(input) = editor.active_text_mut() {
+                        input.clear_selection();
+                    }
+                }
+                Mode::Path(dialog) => dialog.input.clear_selection(),
+                _ => {}
+            }
+        }
         if let Mode::Help(help) = &mut self.mode {
             match mouse.kind {
                 MouseEventKind::ScrollUp => help.scroll = help.scroll.saturating_sub(3),
@@ -1878,6 +2198,7 @@ impl App {
                     self.ensure_visible(selection.cursor);
                 }
             }
+            6 => self.settings.show_overlays = !self.settings.show_overlays,
             _ => {}
         }
     }
@@ -1949,7 +2270,7 @@ impl App {
         let Mode::Field(editor) = &self.mode else {
             return;
         };
-        let start = match editor.start.trim() {
+        let start = match editor.start.value.trim() {
             "" => self.selection.map_or(0, Selection::start),
             input => match parse_offset(input) {
                 Ok(value) => value,
@@ -1959,7 +2280,7 @@ impl App {
                 }
             },
         };
-        let end = match editor.end.trim() {
+        let end = match editor.end.value.trim() {
             "" => self.selection.map_or(0, Selection::end),
             input => match parse_offset(input) {
                 Ok(value) => value,
@@ -1974,12 +2295,12 @@ impl App {
             return;
         }
         let field = Field {
-            name: if editor.name.trim().is_empty() {
+            name: if editor.name.value.trim().is_empty() {
                 format!("field_{}", self.fields.len() + 1)
             } else {
-                editor.name.trim().to_owned()
+                editor.name.value.trim().to_owned()
             },
-            description: editor.description.trim().to_owned(),
+            description: editor.description.value.trim().to_owned(),
             start,
             end,
             color: editor.color,
@@ -2178,9 +2499,7 @@ impl App {
         };
         self.mode = Mode::Path(PathDialog {
             action,
-            input: TextInput {
-                value: suggested.display().to_string(),
-            },
+            input: TextInput::with_value(suggested.display().to_string()),
         });
     }
 
@@ -2407,6 +2726,56 @@ fn nonempty_output(output: &[u8]) -> Option<String> {
     if value.is_empty() { None } else { Some(value) }
 }
 
+fn path_completion_candidates(input: &str) -> Vec<PathBuf> {
+    let typed = Path::new(input);
+    let has_trailing_separator =
+        input.ends_with('/') || input.ends_with('\\') || input.ends_with(std::path::MAIN_SEPARATOR);
+    let (directory, prefix) = if input.is_empty() {
+        (PathBuf::from("."), "")
+    } else if has_trailing_separator {
+        (typed.to_owned(), "")
+    } else {
+        let prefix = typed
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        let directory = typed
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map_or_else(|| PathBuf::from("."), Path::to_owned);
+        (directory, prefix)
+    };
+    let mut candidates = fs::read_dir(directory)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let name = name.to_str()?;
+            name.starts_with(prefix).then(|| {
+                (
+                    entry.path(),
+                    entry.file_type().is_ok_and(|kind| kind.is_dir()),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|(left_path, left_is_dir), (right_path, right_is_dir)| {
+        right_is_dir
+            .cmp(left_is_dir)
+            .then_with(|| left_path.file_name().cmp(&right_path.file_name()))
+    });
+    candidates.into_iter().map(|(path, _)| path).collect()
+}
+
+fn completion_display_path(path: &Path) -> String {
+    let mut display = path.display().to_string();
+    if path.is_dir() && !display.ends_with(std::path::MAIN_SEPARATOR) {
+        display.push(std::path::MAIN_SEPARATOR);
+    }
+    display
+}
+
 fn hex_string(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02X}")).collect()
 }
@@ -2452,8 +2821,64 @@ fn copy_to_clipboard(content: &str) -> Result<(), String> {
 
 #[cfg(not(windows))]
 fn copy_to_clipboard(content: &str) -> Result<(), String> {
-    execute!(io::stdout(), CopyToClipboard::to_clipboard_from(content))
-        .map_err(|error| error.to_string())
+    #[cfg(target_os = "macos")]
+    let commands = vec![("pbcopy", Vec::new())];
+    #[cfg(not(target_os = "macos"))]
+    let commands = vec![
+        ("wl-copy", Vec::new()),
+        ("xclip", vec!["-selection", "clipboard"]),
+        ("xsel", vec!["--clipboard", "--input"]),
+    ];
+
+    let mut errors = Vec::new();
+    for (program, args) in commands {
+        let mut command = Command::new(program);
+        command
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        match write_clipboard_command(&mut command, content) {
+            Ok(()) => return Ok(()),
+            Err(error) => errors.push(format!("{program}: {error}")),
+        }
+    }
+
+    execute!(io::stdout(), CopyToClipboard::to_clipboard_from(content)).map_err(|error| {
+        let attempts = errors.join("; ");
+        if attempts.is_empty() {
+            error.to_string()
+        } else {
+            format!("{attempts}; terminal clipboard fallback failed: {error}")
+        }
+    })
+}
+
+#[cfg(not(windows))]
+fn write_clipboard_command(command: &mut Command, content: &str) -> Result<(), String> {
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("could not start: {error}"))?;
+    let stdin = child
+        .stdin
+        .as_mut()
+        .ok_or_else(|| "did not accept input".to_string())?;
+    stdin
+        .write_all(content.as_bytes())
+        .map_err(|error| format!("could not write data: {error}"))?;
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("could not wait for completion: {error}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let error = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        Err(if error.is_empty() {
+            "did not complete successfully".into()
+        } else {
+            error
+        })
+    }
 }
 
 fn calculate_entropy(bytes: &[u8]) -> Vec<f64> {
@@ -2494,7 +2919,7 @@ fn navigate_python_history(pane: &mut PythonPane, older: bool) {
             }
         };
         pane.history_index = Some(index);
-        pane.input.value = pane.history[index].clone();
+        pane.input.set_value(pane.history[index].clone());
     } else {
         let Some(index) = pane.history_index else {
             return;
@@ -2502,10 +2927,11 @@ fn navigate_python_history(pane: &mut PythonPane, older: bool) {
         if index + 1 < pane.history.len() {
             let next = index + 1;
             pane.history_index = Some(next);
-            pane.input.value = pane.history[next].clone();
+            pane.input.set_value(pane.history[next].clone());
         } else {
             pane.history_index = None;
-            pane.input.value = std::mem::take(&mut pane.history_draft);
+            pane.input
+                .set_value(std::mem::take(&mut pane.history_draft));
         }
     }
 }
@@ -2565,10 +2991,10 @@ mod tests {
     #[test]
     fn new_field_editor_starts_blank_and_uses_the_selection_range() {
         let editor = FieldEditor::new();
-        assert!(editor.name.is_empty());
-        assert!(editor.description.is_empty());
-        assert!(editor.start.is_empty());
-        assert!(editor.end.is_empty());
+        assert!(editor.name.value.is_empty());
+        assert!(editor.description.value.is_empty());
+        assert!(editor.start.value.is_empty());
+        assert!(editor.end.value.is_empty());
 
         let mut app = App::new("sample.bin".into(), vec![0; 16]);
         app.selection = Some(Selection {
@@ -2585,9 +3011,86 @@ mod tests {
     #[test]
     fn field_editor_accepts_ctrl_h_as_backspace() {
         let mut editor = FieldEditor::new();
-        editor.name = "field".into();
+        editor.name = TextInput::with_value("field".into());
+        editor.name.clear_selection();
         editor.handle_text_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL));
-        assert_eq!(editor.name, "fiel");
+        assert_eq!(editor.name.value, "fiel");
+    }
+
+    #[test]
+    fn selected_text_input_is_replaced_by_the_first_keystroke() {
+        let mut input = TextInput::with_value("existing".into());
+        input.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        assert_eq!(input.value, "n");
+
+        input.set_value("existing".into());
+        input.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        input.handle_key(KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE));
+        assert_eq!(input.value, "existin!g");
+    }
+
+    #[test]
+    fn tab_path_completion_lists_then_cycles_matching_paths() {
+        let directory = temporary_file("completion");
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("alpha.bin"), []).unwrap();
+        fs::write(directory.join("alpine.bin"), []).unwrap();
+        let mut input = TextInput::with_value(format!(
+            "{}{}al",
+            directory.display(),
+            std::path::MAIN_SEPARATOR
+        ));
+        input.clear_selection();
+        let mut suggestions = Vec::new();
+        let mut active = None;
+        let mut scroll = 0;
+
+        Workspace::complete_manual_path(&mut input, &mut suggestions, &mut active, &mut scroll);
+        assert_eq!(suggestions.len(), 2);
+        assert_eq!(active, None);
+        Workspace::complete_manual_path(&mut input, &mut suggestions, &mut active, &mut scroll);
+        assert!(input.value.ends_with("alpha.bin"));
+        Workspace::complete_manual_path(&mut input, &mut suggestions, &mut active, &mut scroll);
+        assert!(input.value.ends_with("alpine.bin"));
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn suggestion_navigation_scrolls_past_the_first_page() {
+        let suggestions = (0..PATH_SUGGESTION_PAGE_SIZE + 3)
+            .map(|index| PathBuf::from(format!("file-{index}")))
+            .collect::<Vec<_>>();
+        let mut input = TextInput::default();
+        let mut active = None;
+        let mut scroll = 0;
+
+        Workspace::move_suggestion(
+            &mut input,
+            &suggestions,
+            &mut active,
+            &mut scroll,
+            PATH_SUGGESTION_PAGE_SIZE as isize,
+        );
+
+        assert_eq!(active, Some(PATH_SUGGESTION_PAGE_SIZE));
+        assert_eq!(scroll, 1);
+        assert!(input.value.ends_with("file-12"));
+    }
+
+    #[test]
+    fn closing_a_file_preserves_unsaved_changes_until_confirmed() {
+        let mut workspace = Workspace::new(vec![App::new("sample.bin".into(), vec![0])]);
+        workspace.active_mut().modified_offsets.insert(0);
+        workspace
+            .handle_workspace_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL))
+            .unwrap();
+        assert_eq!(workspace.documents.len(), 1);
+        workspace
+            .handle_workspace_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL))
+            .unwrap();
+        assert!(workspace.documents.is_empty());
     }
 
     #[test]
@@ -2619,7 +3122,7 @@ mod tests {
         workspace
             .handle_workspace_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .unwrap();
-        let Some(OpenFileDialog::ManualPath { input }) = &mut workspace.open_file_dialog else {
+        let Some(OpenFileDialog::ManualPath { input, .. }) = &mut workspace.open_file_dialog else {
             panic!("manual path input should be open");
         };
         input.value = path.display().to_string();

@@ -53,6 +53,7 @@ Workspace:
   Ctrl+B, S         toggle side-by-side comparison
   Mouse click       activate a binary tab
   Ctrl+N            choose a system picker or type a binary path
+  Ctrl+W            close the active binary (press again if unsaved)
   Ctrl+D            toggle byte diff
   e                 toggle active-binary entropy graph
 
@@ -64,11 +65,12 @@ View Mode:
   Ctrl+F            search bytes asynchronously
   n / N             next / previous search match
   Ctrl+G            jump to an offset
-  Ctrl+Shift+C      copy the selection as continuous hexadecimal
+  Ctrl+C            copy the selection as continuous hexadecimal
   gg / G            jump to the start / end of the file
   Ctrl+U / Ctrl+R   undo / redo a byte overwrite
   Ctrl+S            save the edited binary
   Ctrl+O / Ctrl+L   save / load an overlay
+  o                 toggle field overlays
   Ctrl+R            reset an open theme/settings menu with y/n confirmation
   Ctrl+Z            suspend to the shell on Unix (resume with fg)
 
