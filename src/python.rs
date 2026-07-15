@@ -38,11 +38,58 @@ import sys
 import zlib
 from contextlib import redirect_stderr, redirect_stdout
 
-snapshot = pathlib.Path(sys.argv[1])
-selection_start = int(sys.argv[2])
-selection_end = int(sys.argv[3])
-buffer = bytearray(snapshot.read_bytes())
-selected = memoryview(buffer)[selection_start:selection_end + 1]
+MAX_CAPTURED_OUTPUT = 24_000
+
+class LimitedOutput(io.StringIO):
+    def __init__(self):
+        super().__init__()
+        self.truncated = False
+
+    def write(self, text):
+        remaining = MAX_CAPTURED_OUTPUT - self.tell()
+        if remaining > 0:
+            super().write(text[:remaining])
+        if len(text) > remaining:
+            self.truncated = True
+        return len(text)
+
+documents = json.loads(sys.argv[1])
+active_index = int(sys.argv[2])
+buffers = {}
+selected_buffers = {}
+selected_range_buffers = {}
+selection_ranges_buffers = {}
+for document in documents:
+    key = f"buffer_{document['index']}"
+    buffer_value = bytearray(pathlib.Path(document['snapshot']).read_bytes())
+    ranges = document.get("selections") or [{
+        "start": document["selection_start"],
+        "end": document["selection_end"],
+    }]
+    selected_ranges = [
+        memoryview(buffer_value)[selected_range["start"]:selected_range["end"] + 1]
+        for selected_range in ranges
+    ]
+    selected_value = selected_ranges[0] if len(selected_ranges) == 1 else selected_ranges
+    buffers[key] = buffer_value
+    selected_buffers[key] = selected_value
+    selected_range_buffers[key] = selected_ranges
+    selection_ranges_buffers[key] = [
+        (selected_range["start"], selected_range["end"])
+        for selected_range in ranges
+    ]
+    globals()[key] = buffer_value
+    globals()[f"selected_{document['index']}"] = selected_value
+    globals()[f"selected_ranges_{document['index']}"] = selected_ranges
+    globals()[f"selection_ranges_{document['index']}"] = selection_ranges_buffers[key]
+    globals()[f"selection_start_{document['index']}"] = document['selection_start']
+    globals()[f"selection_end_{document['index']}"] = document['selection_end']
+buffer = buffers[f"buffer_{active_index}"]
+selected = selected_buffers[f"buffer_{active_index}"]
+selected_ranges = selected_range_buffers[f"buffer_{active_index}"]
+selection_ranges = selection_ranges_buffers[f"buffer_{active_index}"]
+selection_start = documents[active_index]['selection_start']
+selection_end = documents[active_index]['selection_end']
 if hasattr(signal, "SIGBREAK"):
     signal.signal(signal.SIGBREAK, signal.default_int_handler)
 
@@ -51,28 +98,53 @@ namespace = {
     "base64": base64,
     "binascii": binascii,
     "buffer": buffer,
+    "buffers": buffers,
     "hashlib": hashlib,
     "math": math,
     "pathlib": pathlib,
     "re": re,
     "signal": signal,
     "selected": selected,
+    "selected_buffers": selected_buffers,
+    "selected_ranges": selected_ranges,
+    "selected_range_buffers": selected_range_buffers,
     "selection_start": selection_start,
     "selection_end": selection_end,
+    "selection_ranges": selection_ranges,
+    "selection_ranges_buffers": selection_ranges_buffers,
     "struct": struct,
     "zlib": zlib,
 }
+for document in documents:
+    index = document["index"]
+    key = f"buffer_{index}"
+    namespace[key] = buffers[key]
+    namespace[f"selected_{index}"] = selected_buffers[key]
+    namespace[f"selected_ranges_{index}"] = selected_range_buffers[key]
+    namespace[f"selection_start_{index}"] = document["selection_start"]
+    namespace[f"selection_end_{index}"] = document["selection_end"]
+    namespace[f"selection_ranges_{index}"] = selection_ranges_buffers[key]
+
+def rexedit_help():
+    print("Active: buffer, selected, selected_ranges, selection_start/end, selection_ranges")
+    print("All binaries: buffers['buffer_N'], selected_buffers['buffer_N'], selected_range_buffers['buffer_N']")
+    print("Imports: ast, base64, binascii, hashlib, math, pathlib, re, signal, struct, zlib")
+    print("Use :apply in rexedit to apply same-length changes to every open buffer.")
+
+namespace["rexedit_help"] = rexedit_help
 
 for raw in sys.stdin:
     try:
         request = json.loads(raw)
         if request["kind"] == "apply":
-            snapshot.write_bytes(buffer)
-            response = {"output": "Applied Python buffer to rexedit.", "error": None, "applied": True}
+            for document in documents:
+                key = f"buffer_{document['index']}"
+                pathlib.Path(document['snapshot']).write_bytes(buffers[key])
+            response = {"output": "Applied Python buffers to rexedit.", "error": None, "applied": True}
         else:
             source = request["source"]
-            stdout = io.StringIO()
-            stderr = io.StringIO()
+            stdout = LimitedOutput()
+            stderr = LimitedOutput()
             with redirect_stdout(stdout), redirect_stderr(stderr):
                 try:
                     expression = compile(source, "<rexedit-python>", "eval")
@@ -83,6 +155,8 @@ for raw in sys.stdin:
                     if value is not None:
                         print(repr(value))
             output = stdout.getvalue() + stderr.getvalue()
+            if stdout.truncated or stderr.truncated:
+                output += "\n[Python output truncated; print a slice or summary for more detail.]"
             response = {"output": output.rstrip(), "error": None, "applied": False}
     except BaseException as error:
         response = {"output": "", "error": f"{type(error).__name__}: {error}", "applied": False}
@@ -96,6 +170,22 @@ pub enum PythonCommand {
 }
 
 #[derive(Debug)]
+pub struct PythonDocument {
+    pub index: usize,
+    pub bytes: Vec<u8>,
+    pub selection_start: usize,
+    pub selection_end: usize,
+    pub selections: Vec<(usize, usize)>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PythonSnapshot {
+    pub index: usize,
+    pub path: PathBuf,
+    pub baseline: Vec<u8>,
+}
+
+#[derive(Debug)]
 pub struct PythonResponse {
     pub output: String,
     pub error: Option<String>,
@@ -106,37 +196,62 @@ pub struct PythonResponse {
 pub struct PythonSession {
     commands: Sender<PythonCommand>,
     pub responses: Receiver<PythonResponse>,
-    pub snapshot: PathBuf,
+    pub snapshots: Vec<PythonSnapshot>,
     process_id: u32,
     process_running: Arc<AtomicBool>,
 }
 
 impl PythonSession {
-    pub fn start(
-        bytes: &[u8],
-        selection_start: usize,
-        selection_end: usize,
-    ) -> Result<Self, String> {
+    pub fn start(documents: Vec<PythonDocument>, active_index: usize) -> Result<Self, String> {
         let executable = find_python().ok_or_else(|| {
             "Python was not found. Install Python 3 or set the PYTHON environment variable."
                 .to_string()
         })?;
-        let snapshot = snapshot_path();
-        fs::write(&snapshot, bytes)
-            .map_err(|error| format!("Could not create Python buffer snapshot: {error}"))?;
+        let snapshots = documents
+            .iter()
+            .map(|document| {
+                let path = snapshot_path(document.index);
+                fs::write(&path, &document.bytes)
+                    .map_err(|error| format!("Could not create Python buffer snapshot: {error}"))?;
+                Ok(PythonSnapshot {
+                    index: document.index,
+                    path,
+                    baseline: document.bytes.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        if snapshots.get(active_index).is_none() {
+            return Err("Active Python document is unavailable".into());
+        }
+        let bridge_documents = documents
+            .iter()
+            .zip(&snapshots)
+            .map(|(document, snapshot)| {
+                serde_json::json!({
+                    "index": document.index,
+                    "snapshot": snapshot.path,
+                    "selection_start": document.selection_start,
+                    "selection_end": document.selection_end,
+                    "selections": document
+                        .selections
+                        .iter()
+                        .map(|(start, end)| serde_json::json!({ "start": start, "end": end }))
+                        .collect::<Vec<_>>(),
+                })
+            })
+            .collect::<Vec<_>>();
+        let bridge_documents = serde_json::to_string(&bridge_documents)
+            .map_err(|error| format!("Could not prepare Python buffers: {error}"))?;
 
         let (command_tx, command_rx) = mpsc::channel();
         let (response_tx, response_rx) = mpsc::channel();
-        let worker_snapshot = snapshot.clone();
-        let mut child = match spawn_python(
-            &executable,
-            &worker_snapshot,
-            selection_start,
-            selection_end,
-        ) {
+        let worker_snapshots = snapshots.clone();
+        let mut child = match spawn_python(&executable, &bridge_documents, active_index) {
             Ok(child) => child,
             Err(error) => {
-                let _ = fs::remove_file(&snapshot);
+                for snapshot in snapshots_for_cleanup(&worker_snapshots) {
+                    let _ = fs::remove_file(snapshot);
+                }
                 return Err(error);
             }
         };
@@ -154,13 +269,15 @@ impl PythonSession {
                     applied: false,
                 });
             }
-            let _ = fs::remove_file(worker_snapshot);
+            for snapshot in snapshots_for_cleanup(&worker_snapshots) {
+                let _ = fs::remove_file(snapshot);
+            }
         });
 
         Ok(Self {
             commands: command_tx,
             responses: response_rx,
-            snapshot,
+            snapshots,
             process_id,
             process_running,
         })
@@ -223,22 +340,10 @@ struct BridgeResponse {
     applied: bool,
 }
 
-fn spawn_python(
-    executable: &str,
-    snapshot: &Path,
-    selection_start: usize,
-    selection_end: usize,
-) -> Result<Child, String> {
+fn spawn_python(executable: &str, documents: &str, active_index: usize) -> Result<Child, String> {
     let mut command = Command::new(executable);
     command
-        .args([
-            "-u",
-            "-c",
-            BRIDGE,
-            &snapshot.display().to_string(),
-            &selection_start.to_string(),
-            &selection_end.to_string(),
-        ])
+        .args(["-u", "-c", BRIDGE, documents, &active_index.to_string()])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -343,12 +448,19 @@ fn find_python() -> Option<String> {
     })
 }
 
-fn snapshot_path() -> PathBuf {
+fn snapshot_path(index: usize) -> PathBuf {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    env::temp_dir().join(format!("rexedit-python-{}-{nonce}.bin", std::process::id()))
+    env::temp_dir().join(format!(
+        "rexedit-python-{}-{index}-{nonce}.bin",
+        std::process::id()
+    ))
+}
+
+fn snapshots_for_cleanup(snapshots: &[PythonSnapshot]) -> impl Iterator<Item = &Path> {
+    snapshots.iter().map(|snapshot| snapshot.path.as_path())
 }
 
 #[cfg(test)]
@@ -362,7 +474,17 @@ mod tests {
         if find_python().is_none() {
             return;
         }
-        let session = PythonSession::start(&[1, 2, 3], 0, 1).unwrap();
+        let session = PythonSession::start(
+            vec![PythonDocument {
+                index: 0,
+                bytes: vec![1, 2, 3],
+                selection_start: 0,
+                selection_end: 1,
+                selections: vec![(0, 1)],
+            }],
+            0,
+        )
+        .unwrap();
         session.execute("sum(selected)".into()).unwrap();
         let response = session
             .responses
@@ -381,7 +503,79 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .unwrap();
         assert!(response.applied);
-        assert_eq!(fs::read(&session.snapshot).unwrap(), [255, 2, 3]);
+        assert_eq!(fs::read(&session.snapshots[0].path).unwrap(), [255, 2, 3]);
+    }
+
+    #[test]
+    fn exposes_and_applies_every_open_binary_buffer() {
+        if find_python().is_none() {
+            return;
+        }
+        let session = PythonSession::start(
+            vec![
+                PythonDocument {
+                    index: 0,
+                    bytes: vec![1],
+                    selection_start: 0,
+                    selection_end: 0,
+                    selections: vec![(0, 0)],
+                },
+                PythonDocument {
+                    index: 1,
+                    bytes: vec![2],
+                    selection_start: 0,
+                    selection_end: 0,
+                    selections: vec![(0, 0)],
+                },
+            ],
+            0,
+        )
+        .unwrap();
+        session
+            .execute("buffer_0[0] = 10\nbuffer_1[0] = 20".into())
+            .unwrap();
+        session
+            .responses
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        session.apply().unwrap();
+        assert!(
+            session
+                .responses
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .applied
+        );
+        assert_eq!(fs::read(&session.snapshots[0].path).unwrap(), [10]);
+        assert_eq!(fs::read(&session.snapshots[1].path).unwrap(), [20]);
+    }
+
+    #[test]
+    fn exposes_separate_selections_as_individual_python_views() {
+        if find_python().is_none() {
+            return;
+        }
+        let session = PythonSession::start(
+            vec![PythonDocument {
+                index: 0,
+                bytes: vec![1, 2, 3, 4],
+                selection_start: 0,
+                selection_end: 0,
+                selections: vec![(0, 0), (2, 3)],
+            }],
+            0,
+        )
+        .unwrap();
+        session
+            .execute(
+                "len(selected), len(selected_ranges), sum(len(part) for part in selected)".into(),
+            )
+            .unwrap();
+        let response = session
+            .responses
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(response.output, "(2, 2, 3)");
     }
 
     #[test]
@@ -389,7 +583,17 @@ mod tests {
         if find_python().is_none() {
             return;
         }
-        let session = PythonSession::start(&[0], 0, 0).unwrap();
+        let session = PythonSession::start(
+            vec![PythonDocument {
+                index: 0,
+                bytes: vec![0],
+                selection_start: 0,
+                selection_end: 0,
+                selections: vec![(0, 0)],
+            }],
+            0,
+        )
+        .unwrap();
         session.execute("while True: pass".into()).unwrap();
         thread::sleep(Duration::from_millis(100));
         session.interrupt().unwrap();

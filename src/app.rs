@@ -27,14 +27,17 @@ use crossterm::event::{
 use ratatui::{DefaultTerminal, layout::Rect};
 
 use crate::{
+    entropy::{self, EntropyMessage, EntropyWorker},
     model::{
         ByteColorMode, DEFAULT_BYTES_PER_ROW, Field, FieldColor, NamedColor, Overlay, SearchMatch,
         Selection, Theme,
     },
-    python::PythonSession,
+    python::{PythonDocument, PythonSession, PythonSnapshot},
     search::{self, SearchMessage, SearchWorker},
     ui,
 };
+
+const PYTHON_CONSOLE_LINE_WIDTH: usize = 72;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Focus {
@@ -47,6 +50,7 @@ pub enum Focus {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ScrollbarDrag {
     Viewer,
+    Fields,
     Python,
 }
 
@@ -230,6 +234,7 @@ pub struct FieldEditor {
     pub end: TextInput,
     pub color: FieldColor,
     pub active: usize,
+    ranges: Vec<Selection>,
 }
 
 impl FieldEditor {
@@ -242,6 +247,7 @@ impl FieldEditor {
             end: TextInput::default(),
             color: FieldColor::default(),
             active: 0,
+            ranges: Vec::new(),
         }
     }
 
@@ -254,6 +260,7 @@ impl FieldEditor {
             end: TextInput::with_value(format!("0x{:X}", field.end)),
             color: field.color,
             active: 0,
+            ranges: Vec::new(),
         }
     }
 
@@ -288,6 +295,7 @@ pub struct SettingsEditor {
 #[derive(Debug)]
 pub struct PythonPane {
     pub input: TextInput,
+    pub repl_lines: Vec<String>,
     pub output: Vec<String>,
     pub session: PythonSession,
     pub pending: usize,
@@ -300,7 +308,11 @@ pub struct PythonPane {
 
 impl PythonPane {
     pub fn max_scroll(&self) -> usize {
-        self.output.len().saturating_sub(self.visible_output_lines)
+        self.output
+            .len()
+            .saturating_add(self.repl_lines.len())
+            .saturating_add(1)
+            .saturating_sub(self.visible_output_lines)
     }
 
     pub(crate) fn clamp_scroll(&mut self) {
@@ -402,8 +414,11 @@ pub struct App {
     pub scroll: usize,
     pub visible_rows: usize,
     pub selection: Option<Selection>,
+    pub additional_selections: Vec<Selection>,
     pub fields: Vec<Field>,
     pub selected_field: usize,
+    pub fields_scroll: usize,
+    pub visible_fields: usize,
     pub focus: Focus,
     pub search: SearchState,
     pub mode: Mode,
@@ -426,6 +441,9 @@ pub struct App {
     scrollbar_dragging: Option<ScrollbarDrag>,
     quit_armed: bool,
     pub entropy: Option<Vec<f64>>,
+    entropy_worker: Option<EntropyWorker>,
+    pub entropy_scanned: usize,
+    pub entropy_total: usize,
 }
 
 impl App {
@@ -438,8 +456,11 @@ impl App {
             scroll: 0,
             visible_rows: 1,
             selection,
+            additional_selections: Vec::new(),
             fields: Vec::new(),
             selected_field: 0,
+            fields_scroll: 0,
+            visible_fields: 1,
             focus: Focus::Viewer,
             search: SearchState::default(),
             mode: Mode::Normal,
@@ -462,6 +483,9 @@ impl App {
             scrollbar_dragging: None,
             quit_armed: false,
             entropy: None,
+            entropy_worker: None,
+            entropy_scanned: 0,
+            entropy_total: 0,
         };
         app.rebuild_display_rows();
         app
@@ -469,7 +493,53 @@ impl App {
 
     pub fn entropy_profile(&mut self) -> &[f64] {
         self.entropy
-            .get_or_insert_with(|| calculate_entropy(&self.bytes))
+            .get_or_insert_with(|| entropy::calculate(&self.bytes))
+    }
+
+    pub fn request_entropy(&mut self) {
+        if self.entropy.is_some() || self.entropy_worker.is_some() {
+            return;
+        }
+        self.entropy_total = self.bytes.len();
+        self.entropy_scanned = 0;
+        self.entropy_worker = Some(entropy::spawn(Arc::clone(&self.bytes)));
+        self.status = "Calculating entropy in the background…".into();
+    }
+
+    pub fn entropy_running(&self) -> bool {
+        self.entropy_worker.is_some()
+    }
+
+    fn drain_entropy_messages(&mut self) {
+        let Some(worker) = self.entropy_worker.take() else {
+            return;
+        };
+        let mut keep_worker = true;
+        while let Ok(message) = worker.receiver.try_recv() {
+            match message {
+                EntropyMessage::Progress(scanned) => {
+                    self.entropy_scanned = scanned.min(self.entropy_total);
+                }
+                EntropyMessage::Done(profile) => {
+                    self.entropy = Some(profile);
+                    self.entropy_scanned = self.entropy_total;
+                    self.status = "Entropy calculation complete".into();
+                    keep_worker = false;
+                }
+            }
+        }
+        if keep_worker {
+            self.entropy_worker = Some(worker);
+        }
+    }
+
+    fn invalidate_entropy(&mut self) {
+        if let Some(worker) = self.entropy_worker.take() {
+            worker.cancel();
+        }
+        self.entropy = None;
+        self.entropy_scanned = 0;
+        self.entropy_total = 0;
     }
 }
 
@@ -522,9 +592,17 @@ impl Workspace {
 
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
         loop {
+            let mut snapshots = Vec::new();
             for document in &mut self.documents {
                 document.drain_search_messages();
-                document.drain_python_messages();
+                document.drain_entropy_messages();
+                snapshots.extend(document.drain_python_messages());
+            }
+            self.update_entropy_status();
+            for snapshot in snapshots {
+                if let Some(document) = self.documents.get_mut(snapshot.index) {
+                    document.apply_python_snapshot(&snapshot);
+                }
             }
             terminal.draw(|frame| ui::render_workspace(frame, self))?;
             if !event::poll(Duration::from_millis(40))? {
@@ -593,7 +671,7 @@ impl Workspace {
                     self.open_file_dialog = Some(OpenFileDialog::Choice { active: 0 });
                     return Ok(false);
                 }
-                KeyCode::Char('w')
+                KeyCode::Char('w' | 'W')
                     if !self.active().edit_mode && matches!(self.active().mode, Mode::Normal) =>
                 {
                     self.close_active_document();
@@ -619,11 +697,115 @@ impl Workspace {
         {
             self.show_entropy = !self.show_entropy;
             if self.show_entropy {
-                self.active_mut().entropy_profile();
+                self.request_entropy_for_visible_documents();
+                self.status = "Calculating entropy in the background…".into();
+            } else {
+                self.status = "Entropy panel hidden".into();
             }
             return Ok(false);
         }
+        if key.code == KeyCode::Esc
+            && self.show_entropy
+            && matches!(self.active().mode, Mode::Normal)
+        {
+            self.show_entropy = false;
+            self.status = "Entropy panel hidden".into();
+            return Ok(false);
+        }
+        if key.code == KeyCode::Char('p')
+            && !self.active().edit_mode
+            && matches!(self.active().mode, Mode::Normal)
+        {
+            self.open_python_pane();
+            return Ok(false);
+        }
         self.active_mut().handle_key(key)
+    }
+
+    fn open_python_pane(&mut self) {
+        let active = self.active;
+        if self.documents[active].selection.is_none() {
+            self.status = "Select at least one byte before opening Python".into();
+            return;
+        }
+        let documents = self
+            .documents
+            .iter()
+            .enumerate()
+            .map(|(index, document)| {
+                let selection = document.selection.unwrap_or_else(|| Selection::new(0));
+                let selections = document
+                    .selected_ranges()
+                    .into_iter()
+                    .map(|range| (range.start(), range.end()))
+                    .collect();
+                PythonDocument {
+                    index,
+                    bytes: document.bytes.as_ref().clone(),
+                    selection_start: selection
+                        .start()
+                        .min(document.bytes.len().saturating_sub(1)),
+                    selection_end: selection.end().min(document.bytes.len().saturating_sub(1)),
+                    selections,
+                }
+            })
+            .collect();
+        match PythonSession::start(documents, active) {
+            Ok(session) => self.documents[active].open_python_pane_with_session(session),
+            Err(error) => self.status = error,
+        }
+    }
+
+    fn request_entropy_for_visible_documents(&mut self) {
+        if self.side_by_side {
+            for document in &mut self.documents {
+                document.request_entropy();
+            }
+        } else {
+            self.active_mut().request_entropy();
+        }
+    }
+
+    fn update_entropy_status(&mut self) {
+        if !self.show_entropy {
+            return;
+        }
+        let running = self
+            .documents
+            .iter()
+            .filter(|document| document.entropy_running())
+            .collect::<Vec<_>>();
+        if running.is_empty() {
+            if self
+                .documents
+                .iter()
+                .any(|document| document.entropy.is_some())
+            {
+                self.status = if self.side_by_side && self.diff_mode {
+                    "Entropy profiles ready; showing absolute entropy differences".into()
+                } else {
+                    "Entropy calculation complete".into()
+                };
+            }
+            return;
+        }
+        let scanned = running
+            .iter()
+            .map(|document| document.entropy_scanned)
+            .sum::<usize>();
+        let total = running
+            .iter()
+            .map(|document| document.entropy_total)
+            .sum::<usize>();
+        let percent = scanned
+            .saturating_mul(100)
+            .checked_div(total)
+            .unwrap_or(100);
+        self.status = format!(
+            "Calculating entropy for {}/{} binary files: {percent}%",
+            running.len(),
+            self.documents.len()
+        );
     }
 
     pub(crate) fn handle_workspace_mouse(&mut self, mouse: MouseEvent) {
@@ -708,7 +890,7 @@ impl Workspace {
         }
         self.active = index;
         if self.show_entropy {
-            self.active_mut().entropy_profile();
+            self.request_entropy_for_visible_documents();
         }
         self.status = format!("Active binary: {}", self.active().path.display());
     }
@@ -917,12 +1099,21 @@ impl Workspace {
         if self.documents.is_empty() {
             return;
         }
+        if self
+            .documents
+            .iter()
+            .any(|document| matches!(document.mode, Mode::Python(_)))
+        {
+            self.status = "Close the Python console before closing binaries".into();
+            return;
+        }
         let app = self.active();
         if !app.modified_offsets.is_empty() && !app.quit_armed {
             self.active_mut().quit_armed = true;
             self.status = "Unsaved byte changes: press Ctrl+W again to close without saving".into();
             return;
         }
+        self.active_mut().invalidate_entropy();
         let path = self.documents.remove(self.active).path;
         if self.documents.is_empty() {
             self.active = 0;
@@ -947,7 +1138,7 @@ impl Workspace {
         self.documents.push(App::new(path.clone(), bytes));
         self.active = self.documents.len() - 1;
         if self.show_entropy {
-            self.active_mut().entropy_profile();
+            self.request_entropy_for_visible_documents();
         }
         self.status = format!("Opened {}", path.display());
         Ok(())
@@ -982,6 +1173,55 @@ impl App {
 
     pub fn max_scroll(&self) -> usize {
         self.row_count().saturating_sub(self.visible_rows)
+    }
+
+    pub fn field_max_scroll(&self) -> usize {
+        self.fields.len().saturating_sub(self.visible_fields)
+    }
+
+    pub fn selected_ranges(&self) -> Vec<Selection> {
+        let mut ranges = self.additional_selections.clone();
+        if let Some(selection) = self.selection {
+            ranges.push(selection);
+        }
+        ranges.sort_unstable_by_key(|range| range.start());
+        let mut merged = Vec::<Selection>::new();
+        for range in ranges {
+            if let Some(previous) = merged.last_mut()
+                && range.start() <= previous.end().saturating_add(1)
+            {
+                previous.cursor = previous.end().max(range.end());
+            } else {
+                merged.push(Selection {
+                    anchor: range.start(),
+                    cursor: range.end(),
+                });
+            }
+        }
+        merged
+    }
+
+    pub fn selected_bytes(&self) -> Vec<u8> {
+        let Some(last) = self.bytes.len().checked_sub(1) else {
+            return Vec::new();
+        };
+        self.selected_ranges()
+            .into_iter()
+            .flat_map(|range| {
+                let start = range.start().min(last);
+                let end = range.end().min(last);
+                self.bytes[start..=end].iter().copied()
+            })
+            .collect()
+    }
+
+    pub fn is_selected(&self, offset: usize) -> bool {
+        self.selection
+            .is_some_and(|selection| selection.contains(offset))
+            || self
+                .additional_selections
+                .iter()
+                .any(|selection| selection.contains(offset))
     }
 
     pub fn current_bytes(&self) -> &[u8] {
@@ -1180,7 +1420,6 @@ impl App {
             }
             KeyCode::Char('t') => self.mode = Mode::Theme(ThemeEditor::default()),
             KeyCode::Char('s') => self.mode = Mode::Settings(SettingsEditor::default()),
-            KeyCode::Char('p') => self.open_python_pane(),
             KeyCode::Char('o') => {
                 self.settings.show_overlays = !self.settings.show_overlays;
                 self.status = if self.settings.show_overlays {
@@ -1199,7 +1438,9 @@ impl App {
                 };
             }
             KeyCode::Char('a') if self.selection.is_some() => {
-                self.mode = Mode::Field(FieldEditor::new());
+                let mut editor = FieldEditor::new();
+                editor.ranges = self.selected_ranges();
+                self.mode = Mode::Field(editor);
             }
             KeyCode::Char('g') => self.vim_g_pending = true,
             KeyCode::Char('G') if !self.bytes.is_empty() => {
@@ -1359,6 +1600,7 @@ impl App {
                 match parse_offset(&value) {
                     Ok(offset) if offset < self.bytes.len() => {
                         self.selection = Some(Selection::new(offset));
+                        self.additional_selections.clear();
                         self.ensure_visible(offset);
                         self.status = format!("Jumped to 0x{offset:X}");
                         self.mode = Mode::Normal;
@@ -1399,7 +1641,16 @@ impl App {
                     }
                 }
             }
-            KeyCode::Left | KeyCode::Right => {
+            KeyCode::Left => {
+                if let Mode::Field(editor) = &mut self.mode
+                    && editor.active == 4
+                {
+                    editor.color = editor.color.previous();
+                } else if let Mode::Field(editor) = &mut self.mode {
+                    editor.handle_text_key(key);
+                }
+            }
+            KeyCode::Right => {
                 if let Mode::Field(editor) = &mut self.mode
                     && editor.active == 4
                 {
@@ -1535,25 +1786,16 @@ impl App {
         }
     }
 
-    fn open_python_pane(&mut self) {
-        let Some(selection) = self.selection else {
-            self.status = "Select at least one byte before opening Python".into();
-            return;
-        };
-        match PythonSession::start(
-            &self.bytes,
-            selection.start().min(self.bytes.len().saturating_sub(1)),
-            selection.end().min(self.bytes.len().saturating_sub(1)),
-        ) {
-            Ok(session) => {
-                self.mode = Mode::Python(PythonPane {
+    fn open_python_pane_with_session(&mut self, session: PythonSession) {
+        self.mode = Mode::Python(PythonPane {
                     input: TextInput::default(),
+                    repl_lines: Vec::new(),
                     output: vec![
                         "Python 3 analysis console".into(),
-                        "Available: buffer, selected, selection_start/end".into(),
+                        "Active: buffer, selected, selection_start/end | all documents: buffer_N, selected_N, buffers".into(),
                         "Preloaded: struct, binascii, hashlib, base64, zlib, math, re, pathlib"
                             .into(),
-                        "Use :apply to copy same-length buffer edits back into rexedit.".into(),
+                        "Use rexedit_help() for the complete namespace; :apply writes all same-length buffers.".into(),
                     ],
                     session,
                     pending: 0,
@@ -1563,15 +1805,47 @@ impl App {
                     history_index: None,
                     history_draft: String::new(),
                 });
-                self.focus = Focus::Python;
-                self.status = "Python pane opened".into();
-            }
-            Err(error) => self.status = error,
+        self.focus = Focus::Python;
+        self.status = "Python pane opened".into();
+    }
+
+    #[cfg(test)]
+    fn open_python_pane(&mut self) {
+        let selection = self.selection.unwrap_or_else(|| Selection::new(0));
+        let document = PythonDocument {
+            index: 0,
+            bytes: self.bytes.as_ref().clone(),
+            selection_start: selection.start().min(self.bytes.len().saturating_sub(1)),
+            selection_end: selection.end().min(self.bytes.len().saturating_sub(1)),
+            selections: self
+                .selected_ranges()
+                .into_iter()
+                .map(|range| (range.start(), range.end()))
+                .collect(),
+        };
+        if let Ok(session) = PythonSession::start(vec![document], 0) {
+            self.open_python_pane_with_session(session);
         }
     }
 
     fn handle_python_key(&mut self, key: KeyEvent) {
         if key.code == KeyCode::Esc {
+            if self.focus == Focus::Viewer && self.edit_mode {
+                self.commit_pending_edit();
+                self.edit_mode = false;
+                self.edit_high_nibble = true;
+                self.status = "Python mode: hex View Mode".into();
+                return;
+            }
+            if self.focus == Focus::Python
+                && let Mode::Python(pane) = &mut self.mode
+                && (!pane.repl_lines.is_empty() || !pane.input.value.is_empty())
+            {
+                pane.repl_lines.clear();
+                pane.input = TextInput::default();
+                self.status = "Discarded the unfinished Python block".into();
+                return;
+            }
             if let Mode::Python(pane) = &self.mode {
                 self.python_history = pane.history.clone();
             }
@@ -1651,15 +1925,36 @@ impl App {
             _ => {}
         }
         if key.code == KeyCode::Enter {
-            let command = match &mut self.mode {
+            let mut command = match &mut self.mode {
                 Mode::Python(pane) => pane.input.take_value(),
                 _ => return,
             };
-            if command.trim().is_empty() {
-                return;
-            }
             let result = if let Mode::Python(pane) = &mut self.mode {
-                pane.output.push(format!(">>> {command}"));
+                if !pane.repl_lines.is_empty() {
+                    if command.trim().is_empty() {
+                        command = std::mem::take(&mut pane.repl_lines).join("\n");
+                    } else {
+                        let indentation = python_continuation_indentation(&command);
+                        pane.repl_lines.push(command);
+                        pane.input.set_value(indentation);
+                        pane.scroll = 0;
+                        return;
+                    }
+                } else if command.trim_end().ends_with(':') {
+                    let indentation = python_continuation_indentation(&command);
+                    pane.repl_lines.push(command);
+                    pane.input.set_value(indentation);
+                    pane.scroll = 0;
+                    return;
+                } else if command.trim().is_empty() {
+                    pane.output.push(">>>".into());
+                    pane.scroll = 0;
+                    return;
+                }
+                pane.output
+                    .extend(command.lines().enumerate().map(|(index, line)| {
+                        format!("{} {line}", if index == 0 { ">>>" } else { "..." })
+                    }));
                 pane.scroll = 0;
                 if pane.history.last() != Some(&command) {
                     pane.history.push(command.clone());
@@ -1710,7 +2005,16 @@ impl App {
     }
 
     fn handle_python_content_key(&mut self, key: KeyEvent) {
+        if self.focus == Focus::Viewer && self.edit_mode {
+            self.handle_python_overwrite_key(key);
+            return;
+        }
         match (self.focus, key.code) {
+            (Focus::Viewer, KeyCode::Char('i')) => {
+                self.edit_mode = true;
+                self.edit_high_nibble = true;
+                self.status = "Python mode: hex Overwrite Mode (Esc returns to View Mode)".into();
+            }
             (Focus::Viewer, KeyCode::Left) => {
                 self.move_cursor(-1, key.modifiers.contains(KeyModifiers::SHIFT));
             }
@@ -1751,52 +2055,138 @@ impl App {
         }
     }
 
-    fn drain_python_messages(&mut self) {
+    fn handle_python_overwrite_key(&mut self, key: KeyEvent) {
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('u') => self.undo_overwrite(),
+                KeyCode::Char('r') => self.redo_overwrite(),
+                KeyCode::Char('s') => {
+                    self.status = "Close the Python pane before saving the binary".into();
+                }
+                _ => {}
+            }
+            return;
+        }
+        match key.code {
+            KeyCode::Char(character) if character.is_ascii_hexdigit() => {
+                self.overwrite_nibble(character.to_digit(16).expect("hex digit") as u8)
+            }
+            KeyCode::Left => {
+                self.commit_pending_edit();
+                self.move_cursor(-1, false);
+            }
+            KeyCode::Right => {
+                self.commit_pending_edit();
+                self.move_cursor(1, false);
+            }
+            KeyCode::Up => {
+                self.commit_pending_edit();
+                self.move_cursor(-(self.settings.bytes_per_row as isize), false);
+            }
+            KeyCode::Down => {
+                self.commit_pending_edit();
+                self.move_cursor(self.settings.bytes_per_row as isize, false);
+            }
+            KeyCode::PageUp => {
+                self.commit_pending_edit();
+                self.move_cursor(
+                    -(self
+                        .visible_rows
+                        .saturating_mul(self.settings.bytes_per_row)
+                        as isize),
+                    false,
+                );
+            }
+            KeyCode::PageDown => {
+                self.commit_pending_edit();
+                self.move_cursor(
+                    self.visible_rows
+                        .saturating_mul(self.settings.bytes_per_row) as isize,
+                    false,
+                );
+            }
+            KeyCode::Home => {
+                self.commit_pending_edit();
+                self.select_offset(0, false);
+            }
+            KeyCode::End if !self.bytes.is_empty() => {
+                self.commit_pending_edit();
+                self.select_offset(self.bytes.len() - 1, false);
+            }
+            _ => {}
+        }
+    }
+
+    fn drain_python_messages(&mut self) -> Vec<PythonSnapshot> {
         let responses = match &mut self.mode {
             Mode::Python(pane) => pane.session.responses.try_iter().collect::<Vec<_>>(),
-            _ => return,
+            _ => return Vec::new(),
         };
+        let mut snapshots = Vec::new();
         for response in responses {
             let snapshot = match &mut self.mode {
                 Mode::Python(pane) => {
                     pane.pending = pane.pending.saturating_sub(1);
                     if !response.output.is_empty() {
-                        pane.output
-                            .extend(response.output.lines().map(str::to_owned));
+                        pane.output.extend(wrap_python_output(&response.output));
                     }
                     if let Some(error) = response.error {
-                        pane.output.push(error);
+                        pane.output.extend(wrap_python_output(&error));
                     }
                     pane.scroll = 0;
-                    response.applied.then(|| pane.session.snapshot.clone())
+                    response.applied.then(|| pane.session.snapshots.clone())
                 }
                 _ => None,
             };
-            if let Some(snapshot) = snapshot {
-                self.apply_python_snapshot(&snapshot);
+            if let Some(applied) = snapshot {
+                snapshots.extend(applied);
             }
         }
+        snapshots
     }
 
-    fn apply_python_snapshot(&mut self, snapshot: &Path) {
-        let bytes = match fs::read(snapshot) {
+    fn apply_python_snapshot(&mut self, snapshot: &PythonSnapshot) {
+        let python_bytes = match fs::read(&snapshot.path) {
             Ok(bytes) => bytes,
             Err(error) => {
                 self.status = format!("Could not read Python buffer: {error}");
                 return;
             }
         };
-        if bytes.len() != self.bytes.len() {
+        if python_bytes.len() != self.bytes.len() || snapshot.baseline.len() != self.bytes.len() {
             self.status = format!(
                 "Python buffer length changed from {} to {}; only same-length edits can be applied",
                 self.bytes.len(),
-                bytes.len()
+                python_bytes.len()
             );
+            return;
+        }
+        let mut merged = self.bytes.as_ref().clone();
+        let mut applied = 0;
+        let mut conflicts = 0;
+        for (offset, ((baseline, python), editor)) in snapshot
+            .baseline
+            .iter()
+            .zip(&python_bytes)
+            .zip(self.bytes.iter())
+            .enumerate()
+        {
+            let python_changed = python != baseline;
+            let editor_changed = editor != baseline;
+            if python_changed && editor_changed && python != editor {
+                conflicts += 1;
+            } else if python_changed && python != editor {
+                merged[offset] = *python;
+                applied += 1;
+            }
+        }
+        if applied == 0 && conflicts == 0 {
+            self.status = "Python apply found no buffer changes".into();
             return;
         }
         self.cancel_search();
         self.search.results.clear();
-        self.bytes = Arc::new(bytes);
+        self.bytes = Arc::new(merged);
         self.modified_offsets = self
             .bytes
             .iter()
@@ -1807,9 +2197,18 @@ impl App {
         self.undo_stack.clear();
         self.redo_stack.clear();
         self.pending_edit = None;
-        self.entropy = None;
+        self.invalidate_entropy();
         self.rebuild_display_rows();
-        self.status = "Applied Python buffer; Ctrl+S saves it".into();
+        self.status = match (applied, conflicts) {
+            (0, conflicts) => format!(
+                "Python apply kept {} direct hex edit conflict(s); no changes applied",
+                conflicts
+            ),
+            (applied, 0) => format!("Applied {applied} Python byte change(s); Ctrl+S saves"),
+            (applied, conflicts) => format!(
+                "Applied {applied} Python byte change(s); kept {conflicts} direct hex edit conflict(s)"
+            ),
+        };
     }
 
     fn handle_help_key(&mut self, key: KeyEvent) {
@@ -1900,6 +2299,21 @@ impl App {
 
     fn handle_content_mouse(&mut self, mouse: MouseEvent) {
         match mouse.kind {
+            MouseEventKind::ScrollUp
+                if self.fields_area.contains((mouse.column, mouse.row).into()) =>
+            {
+                self.fields_scroll = self.fields_scroll.saturating_sub(3);
+                self.focus = Focus::Fields;
+            }
+            MouseEventKind::ScrollDown
+                if self.fields_area.contains((mouse.column, mouse.row).into()) =>
+            {
+                self.fields_scroll = self
+                    .fields_scroll
+                    .saturating_add(3)
+                    .min(self.field_max_scroll());
+                self.focus = Focus::Fields;
+            }
             MouseEventKind::ScrollUp => self.scroll = self.scroll.saturating_sub(3),
             MouseEventKind::ScrollDown => {
                 self.scroll = self.scroll.saturating_add(3).min(self.max_scroll());
@@ -1908,6 +2322,14 @@ impl App {
                 if let Some(offset) = self.byte_at(mouse.column, mouse.row) {
                     if self.edit_mode {
                         self.commit_pending_edit();
+                    }
+                    let additive = mouse.modifiers.contains(KeyModifiers::CONTROL);
+                    if additive {
+                        if let Some(selection) = self.selection.take() {
+                            self.additional_selections.push(selection);
+                        }
+                    } else {
+                        self.additional_selections.clear();
                     }
                     self.selection = Some(Selection::new(offset));
                     self.focus = Focus::Viewer;
@@ -1928,7 +2350,9 @@ impl App {
                     selection.cursor = offset;
                 }
             }
-            MouseEventKind::Up(MouseButton::Left) => self.mouse_dragging = false,
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.mouse_dragging = false;
+            }
             _ => {}
         }
     }
@@ -1941,6 +2365,10 @@ impl App {
                     && matches!(self.mode, Mode::Python(_))
                 {
                     Some(ScrollbarDrag::Python)
+                } else if is_scrollbar_column(self.fields_area, mouse.column)
+                    && self.fields_area.contains((mouse.column, mouse.row).into())
+                {
+                    Some(ScrollbarDrag::Fields)
                 } else if is_scrollbar_column(self.viewer_area, mouse.column)
                     && self.viewer_area.contains((mouse.column, mouse.row).into())
                 {
@@ -1965,6 +2393,14 @@ impl App {
                 self.focus = Focus::Viewer;
                 self.scroll =
                     scrollbar_position_from_row(self.viewer_area, mouse.row, self.max_scroll());
+            }
+            ScrollbarDrag::Fields => {
+                self.focus = Focus::Fields;
+                self.fields_scroll = scrollbar_position_from_row(
+                    self.fields_area,
+                    mouse.row,
+                    self.field_max_scroll(),
+                );
             }
             ScrollbarDrag::Python => {
                 self.focus = Focus::Python;
@@ -2032,9 +2468,10 @@ impl App {
         if column < inner_left || column >= inner_right || row < inner_top || row >= inner_bottom {
             return None;
         }
-        let index = usize::from(row.checked_sub(inner_top)?);
-        if index < self.fields.len() {
-            Some(index)
+        let local_row = usize::from(row.checked_sub(inner_top)?);
+        if local_row < self.visible_fields {
+            let index = self.fields_scroll.saturating_add(local_row);
+            (index < self.fields.len()).then_some(index)
         } else {
             None
         }
@@ -2064,12 +2501,14 @@ impl App {
             }
         } else {
             self.selection = Some(Selection::new(offset));
+            self.additional_selections.clear();
         }
         self.ensure_visible(offset);
     }
 
     fn copy_selection_as_hex(&mut self) {
-        let hex = hex_string(self.current_bytes());
+        let selected = self.selected_bytes();
+        let hex = hex_string(&selected);
         if hex.is_empty() {
             self.status = "No bytes selected to copy".into();
             return;
@@ -2099,7 +2538,7 @@ impl App {
         } else {
             (original & 0xF0) | nibble
         };
-        self.entropy = None;
+        self.invalidate_entropy();
         self.rebuild_display_rows();
         self.update_dirty_offset(offset);
         if self.edit_high_nibble {
@@ -2109,6 +2548,7 @@ impl App {
             self.edit_high_nibble = true;
             let next = (offset + 1).min(self.bytes.len() - 1);
             self.selection = Some(Selection::new(next));
+            self.additional_selections.clear();
             self.ensure_visible(next);
         }
         self.status = format!("Modified byte at 0x{offset:X}; Ctrl+S saves");
@@ -2139,11 +2579,12 @@ impl App {
         self.cancel_search();
         self.search.results.clear();
         Arc::make_mut(&mut self.bytes)[action.offset] = action.before;
-        self.entropy = None;
+        self.invalidate_entropy();
         self.rebuild_display_rows();
         self.update_dirty_offset(action.offset);
         self.redo_stack.push(action);
         self.selection = Some(Selection::new(action.offset));
+        self.additional_selections.clear();
         self.ensure_visible(action.offset);
         self.status = format!("Undid overwrite at 0x{:X}", action.offset);
     }
@@ -2157,11 +2598,12 @@ impl App {
         self.cancel_search();
         self.search.results.clear();
         Arc::make_mut(&mut self.bytes)[action.offset] = action.after;
-        self.entropy = None;
+        self.invalidate_entropy();
         self.rebuild_display_rows();
         self.update_dirty_offset(action.offset);
         self.undo_stack.push(action);
         self.selection = Some(Selection::new(action.offset));
+        self.additional_selections.clear();
         self.ensure_visible(action.offset);
         self.status = format!("Redid overwrite at 0x{:X}", action.offset);
     }
@@ -2270,6 +2712,10 @@ impl App {
         let Mode::Field(editor) = &self.mode else {
             return;
         };
+        let use_selected_ranges = editor.editing.is_none()
+            && editor.start.value.trim().is_empty()
+            && editor.end.value.trim().is_empty()
+            && editor.ranges.len() > 1;
         let start = match editor.start.value.trim() {
             "" => self.selection.map_or(0, Selection::start),
             input => match parse_offset(input) {
@@ -2294,23 +2740,49 @@ impl App {
             self.status = "Field range must be ordered and inside the file".into();
             return;
         }
-        let field = Field {
-            name: if editor.name.value.trim().is_empty() {
-                format!("field_{}", self.fields.len() + 1)
-            } else {
-                editor.name.value.trim().to_owned()
-            },
-            description: editor.description.value.trim().to_owned(),
-            start,
-            end,
-            color: editor.color,
+        let name = if editor.name.value.trim().is_empty() {
+            format!("field_{}", self.fields.len() + 1)
+        } else {
+            editor.name.value.trim().to_owned()
         };
         if let Some(index) = editor.editing {
-            self.fields[index] = field;
+            self.fields[index] = Field {
+                name,
+                description: editor.description.value.trim().to_owned(),
+                start,
+                end,
+                color: editor.color,
+            };
             self.selected_field = index;
             self.status = "Field updated".into();
+        } else if use_selected_ranges {
+            let ranges = editor.ranges.clone();
+            let description = editor.description.value.trim().to_owned();
+            let color = editor.color;
+            let added = ranges.len();
+            for (index, range) in ranges.into_iter().enumerate() {
+                self.fields.push(Field {
+                    name: if index == 0 {
+                        name.clone()
+                    } else {
+                        format!("{name} [{}]", index + 1)
+                    },
+                    description: description.clone(),
+                    start: range.start(),
+                    end: range.end(),
+                    color,
+                });
+            }
+            self.selected_field = self.fields.len().saturating_sub(1);
+            self.status = format!("Added {added} fields from the separate selections");
         } else {
-            self.fields.push(field);
+            self.fields.push(Field {
+                name,
+                description: editor.description.value.trim().to_owned(),
+                start,
+                end,
+                color: editor.color,
+            });
             self.selected_field = self.fields.len() - 1;
             self.status = "Field added".into();
         }
@@ -2324,6 +2796,7 @@ impl App {
         }
         let removed = self.fields.remove(self.selected_field);
         self.selected_field = self.selected_field.min(self.fields.len().saturating_sub(1));
+        self.ensure_selected_field_visible();
         self.status = format!("Deleted field '{}'", removed.name);
     }
 
@@ -2352,8 +2825,23 @@ impl App {
                 anchor: start,
                 cursor: end,
             });
+            self.additional_selections.clear();
+            self.additional_selections.clear();
             self.ensure_visible(start);
+            self.ensure_selected_field_visible();
         }
+    }
+
+    fn ensure_selected_field_visible(&mut self) {
+        if self.selected_field < self.fields_scroll {
+            self.fields_scroll = self.selected_field;
+        } else if self.selected_field >= self.fields_scroll.saturating_add(self.visible_fields) {
+            self.fields_scroll = self
+                .selected_field
+                .saturating_add(1)
+                .saturating_sub(self.visible_fields);
+        }
+        self.fields_scroll = self.fields_scroll.min(self.field_max_scroll());
     }
 
     fn start_search(&mut self, query: String) {
@@ -2881,27 +3369,21 @@ fn write_clipboard_command(command: &mut Command, content: &str) -> Result<(), S
     }
 }
 
-fn calculate_entropy(bytes: &[u8]) -> Vec<f64> {
-    if bytes.is_empty() {
-        return vec![0.0];
-    }
-    let target_buckets = 128usize;
-    let window = bytes.len().div_ceil(target_buckets).max(256);
-    bytes
-        .chunks(window)
-        .map(|chunk| {
-            let mut counts = [0usize; 256];
-            for byte in chunk {
-                counts[usize::from(*byte)] += 1;
+fn wrap_python_output(output: &str) -> Vec<String> {
+    output
+        .split('\n')
+        .flat_map(|line| {
+            let chunks = line
+                .chars()
+                .collect::<Vec<_>>()
+                .chunks(PYTHON_CONSOLE_LINE_WIDTH)
+                .map(|chunk| chunk.iter().collect::<String>())
+                .collect::<Vec<_>>();
+            if chunks.is_empty() {
+                vec![String::new()]
+            } else {
+                chunks
             }
-            counts
-                .into_iter()
-                .filter(|count| *count > 0)
-                .map(|count| {
-                    let probability = count as f64 / chunk.len() as f64;
-                    -probability * probability.log2()
-                })
-                .sum()
         })
         .collect()
 }
@@ -2914,12 +3396,13 @@ fn navigate_python_history(pane: &mut PythonPane, older: bool) {
         let index = match pane.history_index {
             Some(index) => index.saturating_sub(1),
             None => {
-                pane.history_draft = pane.input.value.clone();
+                pane.history_draft = python_input_source(pane);
                 pane.history.len() - 1
             }
         };
         pane.history_index = Some(index);
-        pane.input.set_value(pane.history[index].clone());
+        let source = pane.history[index].clone();
+        set_python_input_source(pane, &source);
     } else {
         let Some(index) = pane.history_index else {
             return;
@@ -2927,13 +3410,38 @@ fn navigate_python_history(pane: &mut PythonPane, older: bool) {
         if index + 1 < pane.history.len() {
             let next = index + 1;
             pane.history_index = Some(next);
-            pane.input.set_value(pane.history[next].clone());
+            let source = pane.history[next].clone();
+            set_python_input_source(pane, &source);
         } else {
             pane.history_index = None;
-            pane.input
-                .set_value(std::mem::take(&mut pane.history_draft));
+            let draft = std::mem::take(&mut pane.history_draft);
+            set_python_input_source(pane, &draft);
         }
     }
+}
+
+fn python_input_source(pane: &PythonPane) -> String {
+    pane.repl_lines
+        .iter()
+        .chain(std::iter::once(&pane.input.value))
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn set_python_input_source(pane: &mut PythonPane, source: &str) {
+    let mut lines = source.split('\n').map(str::to_owned).collect::<Vec<_>>();
+    let input = lines.pop().unwrap_or_default();
+    pane.repl_lines = lines;
+    pane.input.set_value(input);
+}
+
+fn python_continuation_indentation(line: &str) -> String {
+    let existing = line
+        .chars()
+        .take_while(|character| matches!(character, ' ' | '\t'))
+        .collect::<String>();
+    format!("{existing}    ")
 }
 
 fn is_scrollbar_column(area: Rect, column: u16) -> bool {
@@ -2986,6 +3494,35 @@ mod tests {
     #[test]
     fn copies_selected_bytes_as_continuous_hex() {
         assert_eq!(hex_string(&[0xDE, 0xAD, 0x00, 0xEF]), "DEAD00EF");
+    }
+
+    #[test]
+    fn python_output_is_chunked_into_scrollable_console_rows() {
+        let output = "x".repeat(PYTHON_CONSOLE_LINE_WIDTH * 2 + 1);
+        let lines = wrap_python_output(&output);
+        assert_eq!(lines.len(), 3);
+        assert!(
+            lines
+                .iter()
+                .all(|line| line.chars().count() <= PYTHON_CONSOLE_LINE_WIDTH)
+        );
+    }
+
+    #[test]
+    fn python_apply_merges_non_conflicting_changes_and_keeps_hex_edit_conflicts() {
+        let path = temporary_file("python-merge.bin");
+        fs::write(&path, [3, 4]).unwrap();
+        let mut app = App::new("sample.bin".into(), vec![1, 2]);
+        app.bytes = Arc::new(vec![9, 2]);
+        app.apply_python_snapshot(&PythonSnapshot {
+            index: 0,
+            path: path.clone(),
+            baseline: vec![1, 2],
+        });
+
+        assert_eq!(app.bytes.as_slice(), [9, 4]);
+        assert!(app.status.contains("conflict"));
+        fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -3286,8 +3823,8 @@ mod tests {
 
     #[test]
     fn entropy_distinguishes_uniform_and_varied_data() {
-        let uniform = calculate_entropy(&vec![0; 1024]);
-        let varied = calculate_entropy(&(0..=255).cycle().take(1024).collect::<Vec<_>>());
+        let uniform = entropy::calculate(&vec![0; 1024]);
+        let varied = entropy::calculate(&(0..=255).cycle().take(1024).collect::<Vec<_>>());
         assert_eq!(uniform[0], 0.0);
         assert!(varied[0] > 7.9);
     }
@@ -3312,6 +3849,47 @@ mod tests {
             .handle_workspace_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE))
             .unwrap();
         assert_eq!(workspace.active, 0);
+    }
+
+    #[test]
+    fn side_by_side_python_console_receives_a_visible_pane() {
+        let mut workspace = Workspace::new(vec![
+            App::new("one.bin".into(), vec![1, 2]),
+            App::new("two.bin".into(), vec![3, 4]),
+        ]);
+        workspace.side_by_side = true;
+        workspace.open_python_pane();
+        if !matches!(workspace.active().mode, Mode::Python(_)) {
+            return;
+        }
+
+        let backend = ratatui::backend::TestBackend::new(160, 48);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| ui::render_workspace(frame, &mut workspace))
+            .unwrap();
+
+        assert!(workspace.active().python_area.height > 3);
+    }
+
+    #[test]
+    fn workspace_shortcuts_close_side_by_side_files_and_hide_entropy() {
+        let mut workspace = Workspace::new(vec![
+            App::new("one.bin".into(), vec![1]),
+            App::new("two.bin".into(), vec![2]),
+        ]);
+        workspace.side_by_side = true;
+        workspace.show_entropy = true;
+        workspace
+            .handle_workspace_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        assert!(!workspace.show_entropy);
+
+        workspace
+            .handle_workspace_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL))
+            .unwrap();
+        assert_eq!(workspace.documents.len(), 1);
+        assert!(!workspace.side_by_side);
     }
 
     #[test]
@@ -3367,6 +3945,101 @@ mod tests {
     }
 
     #[test]
+    fn separate_selections_are_merged_in_file_order_for_copying() {
+        let mut app = App::new("sample.bin".into(), (0..10).collect());
+        app.selection = Some(Selection {
+            anchor: 7,
+            cursor: 8,
+        });
+        app.additional_selections = vec![Selection {
+            anchor: 2,
+            cursor: 3,
+        }];
+
+        assert_eq!(
+            app.selected_ranges(),
+            [
+                Selection {
+                    anchor: 2,
+                    cursor: 3
+                },
+                Selection {
+                    anchor: 7,
+                    cursor: 8
+                }
+            ]
+        );
+        assert_eq!(app.selected_bytes(), [2, 3, 7, 8]);
+    }
+
+    #[test]
+    fn control_mouse_drag_adds_a_separate_selection() {
+        let mut app = App::new("sample.bin".into(), (0..8).collect());
+        app.viewer_area = Rect::new(0, 0, 80, 5);
+        app.handle_content_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 14,
+            row: 1,
+            modifiers: KeyModifiers::CONTROL,
+        });
+        app.handle_content_mouse(MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 20,
+            row: 1,
+            modifiers: KeyModifiers::CONTROL,
+        });
+
+        assert_eq!(app.additional_selections, [Selection::new(0)]);
+        assert_eq!(app.selection.unwrap().start(), 1);
+        assert_eq!(app.selection.unwrap().end(), 3);
+    }
+
+    #[test]
+    fn blank_field_ranges_create_one_field_per_separate_selection() {
+        let mut app = App::new("sample.bin".into(), vec![0; 10]);
+        app.selection = Some(Selection {
+            anchor: 1,
+            cursor: 2,
+        });
+        app.additional_selections = vec![Selection {
+            anchor: 6,
+            cursor: 7,
+        }];
+        let mut editor = FieldEditor::new();
+        editor.ranges = app.selected_ranges();
+        editor.name.set_value("header".into());
+        app.mode = Mode::Field(editor);
+
+        app.commit_field_editor();
+
+        assert_eq!(app.fields.len(), 2);
+        assert_eq!(app.fields[0].name, "header");
+        assert_eq!(app.fields[1].name, "header [2]");
+        assert_eq!((app.fields[0].start, app.fields[0].end), (1, 2));
+        assert_eq!((app.fields[1].start, app.fields[1].end), (6, 7));
+    }
+
+    #[test]
+    fn field_rows_follow_the_fields_scroll_offset() {
+        let mut app = App::new("sample.bin".into(), vec![0; 32]);
+        app.fields = (0..8)
+            .map(|index| Field {
+                name: format!("field_{index}"),
+                description: String::new(),
+                start: index,
+                end: index,
+                color: FieldColor::Cyan,
+            })
+            .collect();
+        app.fields_area = Rect::new(0, 0, 42, 8);
+        app.visible_fields = 3;
+        app.fields_scroll = 4;
+
+        assert_eq!(app.field_at(1, 1), Some(4));
+        assert_eq!(app.field_at(1, 4), None);
+    }
+
+    #[test]
     fn mouse_coordinates_outside_viewer_never_underflow() {
         let mut app = App::new("sample.bin".into(), vec![0; 256]);
         app.viewer_area = Rect::new(40, 10, 30, 12);
@@ -3410,6 +4083,60 @@ mod tests {
         assert_eq!(pane.input.value, "second");
         navigate_python_history(pane, false);
         assert_eq!(pane.input.value, "unfinished");
+    }
+
+    #[test]
+    fn python_history_restores_multiline_blocks_with_indentation() {
+        let mut app = App::new("sample.bin".into(), vec![0]);
+        app.open_python_pane();
+        let Mode::Python(pane) = &mut app.mode else {
+            return;
+        };
+        pane.history = vec!["if ready:\n    process()".into()];
+
+        navigate_python_history(pane, true);
+
+        assert_eq!(pane.repl_lines, ["if ready:"]);
+        assert_eq!(pane.input.value, "    process()");
+    }
+
+    #[test]
+    fn python_repl_auto_indents_after_a_block_header() {
+        let mut app = App::new("sample.bin".into(), vec![0]);
+        app.open_python_pane();
+        let Mode::Python(pane) = &mut app.mode else {
+            return;
+        };
+        pane.input.set_value("if enabled:".into());
+
+        app.handle_python_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        let Mode::Python(pane) = &app.mode else {
+            unreachable!();
+        };
+        assert_eq!(pane.repl_lines, ["if enabled:"]);
+        assert_eq!(pane.input.value, "    ");
+    }
+
+    #[test]
+    fn blank_python_input_adds_another_prompt_line() {
+        let mut app = App::new("sample.bin".into(), vec![0]);
+        app.open_python_pane();
+        if !matches!(app.mode, Mode::Python(_)) {
+            return;
+        }
+        let previous_length = match &app.mode {
+            Mode::Python(pane) => pane.output.len(),
+            _ => unreachable!(),
+        };
+
+        app.handle_python_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        let Mode::Python(pane) = &app.mode else {
+            unreachable!();
+        };
+        assert_eq!(pane.output.len(), previous_length + 1);
+        assert_eq!(pane.output.last().map(String::as_str), Some(">>>"));
     }
 
     #[test]
