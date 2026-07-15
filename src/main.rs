@@ -1,4 +1,5 @@
 mod app;
+mod entropy;
 mod model;
 mod python;
 mod search;

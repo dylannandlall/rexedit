@@ -58,16 +58,32 @@ pub enum FieldColor {
     Magenta,
     Blue,
     Red,
+    LightCyan,
+    LightGreen,
+    LightYellow,
+    LightMagenta,
+    LightBlue,
+    LightRed,
+    White,
+    Gray,
 }
 
 impl FieldColor {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 14] = [
         Self::Cyan,
         Self::Green,
         Self::Yellow,
         Self::Magenta,
         Self::Blue,
         Self::Red,
+        Self::LightCyan,
+        Self::LightGreen,
+        Self::LightYellow,
+        Self::LightMagenta,
+        Self::LightBlue,
+        Self::LightRed,
+        Self::White,
+        Self::Gray,
     ];
 
     pub fn next(self) -> Self {
@@ -78,6 +94,14 @@ impl FieldColor {
         Self::ALL[(index + 1) % Self::ALL.len()]
     }
 
+    pub fn previous(self) -> Self {
+        let index = Self::ALL
+            .iter()
+            .position(|color| *color == self)
+            .unwrap_or(0);
+        Self::ALL[(index + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             Self::Cyan => "cyan",
@@ -86,6 +110,14 @@ impl FieldColor {
             Self::Magenta => "magenta",
             Self::Blue => "blue",
             Self::Red => "red",
+            Self::LightCyan => "light cyan",
+            Self::LightGreen => "light green",
+            Self::LightYellow => "light yellow",
+            Self::LightMagenta => "light magenta",
+            Self::LightBlue => "light blue",
+            Self::LightRed => "light red",
+            Self::White => "white",
+            Self::Gray => "gray",
         }
     }
 
@@ -97,7 +129,27 @@ impl FieldColor {
             Self::Magenta => Color::Magenta,
             Self::Blue => Color::Blue,
             Self::Red => Color::Red,
+            Self::LightCyan => Color::LightCyan,
+            Self::LightGreen => Color::LightGreen,
+            Self::LightYellow => Color::LightYellow,
+            Self::LightMagenta => Color::LightMagenta,
+            Self::LightBlue => Color::LightBlue,
+            Self::LightRed => Color::LightRed,
+            Self::White => Color::White,
+            Self::Gray => Color::Gray,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FieldColor;
+
+    #[test]
+    fn field_colors_cycle_in_both_directions() {
+        assert_eq!(FieldColor::Cyan.next(), FieldColor::Green);
+        assert_eq!(FieldColor::Cyan.previous(), FieldColor::Gray);
+        assert_eq!(FieldColor::Gray.next(), FieldColor::Cyan);
     }
 }
 

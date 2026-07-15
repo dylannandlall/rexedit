@@ -10,7 +10,7 @@ side-by-side diffs, customizable themes, and entropy visualization.
 ## Features
 
 - Synchronized hexadecimal and ASCII views
-- Mouse and keyboard byte-range selection
+- Mouse and keyboard byte-range selection, including Ctrl + mouse-drag additive ranges
 - In-memory byte overwrite mode with undo and redo
 - Signed, unsigned, floating-point, binary, ASCII, and endian-aware inspection
 - Asynchronous hexadecimal, decimal, binary, wildcard, and regex search
@@ -185,7 +185,7 @@ reference.
 | `Ctrl+N` | Choose the system file picker or type a full or relative path; Tab lists and cycles matches, while arrows/Page Up/Page Down or the mouse wheel navigate all suggestions |
 | `Ctrl+W` | Close the active binary (press again to discard unsaved byte changes) |
 | `Ctrl+D` | Toggle byte-difference highlighting |
-| `e` | Toggle the active binary's entropy graph |
+| `e` / `Esc` | Show / hide entropy. In side-by-side diff mode, the panel shows absolute entropy differences. Calculations run in the background with progress feedback. |
 | Mouse click on a tab or pane | Activate that binary |
 
 Turning off side-by-side comparison also disables diff mode. Comparison panes
@@ -200,12 +200,13 @@ aligned.
 | Shift + arrows | Extend the selection |
 | `gg` / `Shift+G` | Vim-style jump to the start or end of the file |
 | Mouse drag | Select a byte range |
+| Ctrl + mouse drag | Add a separate byte range (mouse-only, so it does not conflict with zsh or PowerShell keybindings) |
 | Mouse wheel | Scroll |
 | `i` | Enter Overwrite Mode |
 | `Ctrl+F` | Search the binary |
 | `n` / `N` | Next or previous search result |
 | `Ctrl+G` | Jump to an offset |
-| `Ctrl+C` / `Ctrl+Shift+C` | Copy the selection as continuous hexadecimal (for example, `DEADBEEF`) |
+| `Ctrl+C` / `Ctrl+Shift+C` | Copy all selected ranges as continuous hexadecimal, in file order (for example, `DEADBEEF`) |
 | `Ctrl+U` / `Ctrl+R` | Undo or redo a byte overwrite |
 | `Ctrl+S` | Save the edited binary |
 | `a` | Create a field from the selection |
@@ -261,7 +262,8 @@ re:\x4D\x5A.{2}
 ## Fields and overlays
 
 Select a byte range and press `a` to create a named field. New field inputs are
-blank; leaving start and end blank keeps the current selection. Fields support:
+blank; leaving start and end blank keeps the current selection. With separate
+selections, rexedit creates one identically colored field per range. Fields support:
 
 - editable start and end offsets;
 - a name and description;
@@ -303,13 +305,23 @@ active binary. Python must be available as `python`, `python3`, or through the
 The console provides:
 
 - `buffer`, a mutable `bytearray` snapshot of the complete binary;
-- `selected`, a view of the selection that was active when the pane opened;
+- `selected`, a memory view for one range or a list of memory views for separate ranges;
+- `selected_ranges` and `selection_ranges`, the individual views and their offset pairs;
 - `selection_start` and `selection_end`;
+- every open binary as `buffer_0`, `buffer_1`, and so on, with matching
+  `selected_N`, `selected_ranges_N`, `selection_start_N`, and `selection_end_N`
+  names; `buffers`, `selected_buffers`, and `selected_range_buffers` provide
+  the same data as dictionaries;
 - preloaded `struct`, `binascii`, `hashlib`, `base64`, `zlib`, `math`, `re`,
   `signal`, and `pathlib` modules.
 
-Expressions print their result and variables persist between commands. Enter
-`:apply` to copy same-length changes from `buffer` back into rexedit. Length
+Expressions print their result and variables persist between commands. Enter a
+line ending in `:` to start a Python-style multi-line block, then submit a
+blank continuation line to execute it. Run `rexedit_help()` for the complete
+namespace. Enter `:apply` to copy same-length changes from every buffer back
+into rexedit. A blank interpreter prompt records another prompt line without
+executing code. Continuation history restores each line and its indentation;
+block headers automatically indent the next line. Length
 changes are rejected because the editor currently supports byte overwrite,
 not insertion or deletion. Press `Ctrl+L` to clear the pane and Escape to
 close it. Page Up/Page Down and the mouse wheel scroll output history;
@@ -320,6 +332,14 @@ currently visible section of the interpreter history. Click or drag either
 pane's scrollbar to jump through its content. Up and Down recall Python
 commands, restoring unfinished input after moving past the newest command.
 Command history survives closing and reopening the pane until rexedit exits.
+You can enter hex overwrite mode (`i`) while the Python pane is open and the
+viewer has focus. On `:apply`, independent Python and hex edits merge; when
+both changed the same byte differently, the direct hex edit is retained and
+rexedit reports the conflict.
+
+Console output is bounded and wrapped into scrollable rows so large values
+such as full binary buffers cannot hide the prompt. When output is truncated,
+use a Python slice or summary (for example, `buffer[:64]` or `len(buffer)`).
 `Ctrl+C` interrupts the currently running Python command without terminating
 rexedit.
 

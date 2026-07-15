@@ -34,14 +34,33 @@ pub fn render_workspace(frame: &mut Frame, workspace: &mut Workspace) {
         let [main, entropy] =
             Layout::vertical([Constraint::Percentage(72), Constraint::Percentage(28)])
                 .areas(content);
-        render_entropy(frame, workspace.active(), entropy);
+        render_workspace_entropy(frame, workspace, entropy);
         main
     } else {
         content
     };
 
     if workspace.side_by_side && workspace.documents.len() > 1 {
-        render_comparison(frame, workspace, content);
+        let active = workspace.active;
+        let (comparison, python_area) =
+            if matches!(workspace.documents[active].mode, Mode::Python(_)) {
+                let [comparison, python] =
+                    Layout::vertical([Constraint::Percentage(60), Constraint::Percentage(40)])
+                        .areas(content);
+                (comparison, Some(python))
+            } else {
+                (content, None)
+            };
+        render_comparison(frame, workspace, comparison);
+        if let Some(area) = python_area {
+            let app = &mut workspace.documents[active];
+            app.python_area = area;
+            if let Mode::Python(pane) = &mut app.mode {
+                pane.visible_output_lines = area.height.saturating_sub(4) as usize;
+                pane.clamp_scroll();
+                render_python_pane(frame, pane, area, app.focus == Focus::Python);
+            }
+        }
         render_mode_modal(frame, &workspace.documents[workspace.active]);
     } else {
         workspace.comparison_panes.clear();
@@ -106,6 +125,8 @@ fn render_in(frame: &mut Frame, app: &mut App, area: Rect) {
     app.python_area = python_area.unwrap_or_default();
     app.visible_rows = viewer.height.saturating_sub(2) as usize;
     app.scroll = app.scroll.min(app.max_scroll());
+    app.visible_fields = fields.height.saturating_sub(5).max(1) as usize;
+    app.fields_scroll = app.fields_scroll.min(app.field_max_scroll());
     if let Mode::Python(pane) = &mut app.mode {
         pane.visible_output_lines = app.python_area.height.saturating_sub(4) as usize;
         pane.clamp_scroll();
@@ -241,7 +262,7 @@ fn render_comparison(frame: &mut Frame, workspace: &mut Workspace, area: Rect) {
         render_viewer(frame, document, *pane, Some(&name), diff_reference);
     }
     let help = format!(
-        "Ctrl+B then Left/Right switch, S comparison | Ctrl+N open | Ctrl+W close | Ctrl+D diff | Ctrl+F search | e entropy | ? keybinds | {}",
+        "Ctrl+B then Left/Right switch, S comparison | Ctrl+N open | Ctrl+W close | Ctrl+D diff | e/Esc entropy | ? keybinds | {}",
         workspace.status
     );
     frame.render_widget(
@@ -250,7 +271,54 @@ fn render_comparison(frame: &mut Frame, workspace: &mut Workspace, area: Rect) {
     );
 }
 
+fn render_workspace_entropy(frame: &mut Frame, workspace: &Workspace, area: Rect) {
+    if workspace.side_by_side && workspace.documents.len() > 1 {
+        if workspace.diff_mode {
+            let active = workspace.active;
+            let comparison = workspace.comparison_index().unwrap_or(active);
+            let [active_area, diff_area] =
+                Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+                    .areas(area);
+            render_entropy(frame, &workspace.documents[active], active_area);
+            render_entropy_difference(
+                frame,
+                &workspace.documents[active],
+                &workspace.documents[comparison],
+                diff_area,
+            );
+        } else {
+            let constraints = vec![
+                Constraint::Ratio(1, workspace.documents.len() as u32);
+                workspace.documents.len()
+            ];
+            let areas = Layout::horizontal(constraints).split(area);
+            for (document, area) in workspace.documents.iter().zip(areas.iter()) {
+                render_entropy(frame, document, *area);
+            }
+        }
+    } else {
+        render_entropy(frame, workspace.active(), area);
+    }
+}
+
 fn render_entropy(frame: &mut Frame, app: &App, area: Rect) {
+    if app.entropy.is_none() {
+        let percent = app
+            .entropy_scanned
+            .saturating_mul(100)
+            .checked_div(app.entropy_total)
+            .unwrap_or(0);
+        frame.render_widget(
+            Paragraph::new(format!(" Calculating entropy… {percent}% ")).block(
+                Block::default()
+                    .title(format!(" Entropy - {} ", app.path.display()))
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Yellow)),
+            ),
+            area,
+        );
+        return;
+    }
     let data = app
         .entropy
         .as_deref()
@@ -277,6 +345,57 @@ fn render_entropy(frame: &mut Frame, app: &App, area: Rect) {
                     ))
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::Magenta)),
+            ),
+        area,
+    );
+}
+
+fn render_entropy_difference(frame: &mut Frame, active: &App, comparison: &App, area: Rect) {
+    let (Some(active_profile), Some(comparison_profile)) =
+        (active.entropy.as_deref(), comparison.entropy.as_deref())
+    else {
+        frame.render_widget(
+            Paragraph::new(" Calculating both entropy profiles before showing the difference… ")
+                .wrap(Wrap { trim: false })
+                .block(
+                    Block::default()
+                        .title(" Entropy difference ")
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::Yellow)),
+                ),
+            area,
+        );
+        return;
+    };
+    let points = active_profile.len().max(comparison_profile.len()).max(1);
+    let data = (0..points)
+        .map(|index| {
+            let active_index =
+                index * active_profile.len().saturating_sub(1) / points.saturating_sub(1).max(1);
+            let comparison_index = index * comparison_profile.len().saturating_sub(1)
+                / points.saturating_sub(1).max(1);
+            let active_value = active_profile.get(active_index).copied().unwrap_or(0.0);
+            let comparison_value = comparison_profile
+                .get(comparison_index)
+                .copied()
+                .unwrap_or(0.0);
+            ((active_value - comparison_value).abs() * 100.0) as u64
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        Sparkline::default()
+            .data(&data)
+            .max(800)
+            .style(Style::default().fg(Color::LightRed))
+            .block(
+                Block::default()
+                    .title(format!(
+                        " Entropy difference - {} vs {} ",
+                        active.path.display(),
+                        comparison.path.display()
+                    ))
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::LightRed)),
             ),
         area,
     );
@@ -475,10 +594,7 @@ fn byte_style(app: &App, offset: usize, byte: u8, ascii: bool) -> Style {
             .bg(app.theme.search_background.color())
             .add_modifier(Modifier::BOLD);
     }
-    if app
-        .selection
-        .is_some_and(|selection| selection.contains(offset))
-    {
+    if app.is_selected(offset) {
         style = style
             .bg(app.theme.selection_background.color())
             .fg(Color::White)
@@ -489,8 +605,14 @@ fn byte_style(app: &App, offset: usize, byte: u8, ascii: bool) -> Style {
 
 fn render_fields(frame: &mut Frame, app: &App, area: Rect) {
     let mut lines = Vec::new();
-    let list_height = area.height.saturating_sub(6) as usize;
-    for (index, field) in app.fields.iter().take(list_height.max(1)).enumerate() {
+    let list_height = app.visible_fields;
+    for (index, field) in app
+        .fields
+        .iter()
+        .enumerate()
+        .skip(app.fields_scroll)
+        .take(list_height)
+    {
         let selected = index == app.selected_field;
         let marker = if selected { ">" } else { " " };
         let style = if selected {
@@ -535,13 +657,25 @@ fn render_fields(frame: &mut Frame, app: &App, area: Rect) {
         Paragraph::new(lines).block(
             Block::default()
                 .title(Span::styled(
-                    " Fields [a add, Enter edit, d delete] ",
+                    " Fields [wheel scroll, a add, Enter edit, d delete] ",
                     title_style(app, active),
                 ))
                 .borders(Borders::ALL)
                 .border_style(border_style(app, active)),
         ),
         area,
+    );
+    render_vertical_scrollbar(
+        frame,
+        area,
+        app.fields.len(),
+        list_height,
+        app.fields_scroll,
+        if active {
+            Color::Cyan
+        } else {
+            app.theme.border.color()
+        },
     );
 }
 
@@ -922,6 +1056,14 @@ fn render_manual_path_modal(
         ),
         area,
     );
+    render_vertical_scrollbar(
+        frame,
+        area,
+        suggestions.len(),
+        PATH_SUGGESTION_PAGE_SIZE,
+        suggestion_scroll,
+        Color::Cyan,
+    );
 }
 
 fn input_line(input: &crate::app::TextInput) -> Line<'static> {
@@ -1164,13 +1306,26 @@ fn render_reset_confirmation(frame: &mut Frame, target: ResetTarget) {
 
 fn render_python_pane(frame: &mut Frame, pane: &PythonPane, area: Rect, active: bool) {
     let output_height = area.height.saturating_sub(4) as usize;
-    let (start, end) = python_output_range(pane.output.len(), output_height, pane.scroll);
-    let mut lines = pane.output[start..end]
+    let mut content = pane
+        .output
         .iter()
         .map(|line| Line::raw(line.clone()))
         .collect::<Vec<_>>();
-    lines.push(Line::from(""));
-    let mut input_spans = vec![Span::styled(">>> ", Style::default().fg(Color::LightGreen))];
+    if !pane.repl_lines.is_empty() {
+        content.push(Line::from(""));
+        content.extend(pane.repl_lines.iter().map(|line| {
+            Line::from(vec![
+                Span::styled("... ", Style::default().fg(Color::LightGreen)),
+                Span::raw(line.clone()),
+            ])
+        }));
+    }
+    let prompt = if pane.repl_lines.is_empty() {
+        ">>> "
+    } else {
+        "... "
+    };
+    let mut input_spans = vec![Span::styled(prompt, Style::default().fg(Color::LightGreen))];
     input_spans.extend(editable_spans(
         &pane.input,
         Style::default().fg(Color::White),
@@ -1182,7 +1337,9 @@ fn render_python_pane(frame: &mut Frame, pane: &PythonPane, area: Rect, active: 
             Style::default().fg(Color::Yellow),
         ));
     }
-    lines.push(Line::from(input_spans));
+    content.push(Line::from(input_spans));
+    let (start, end) = python_output_range(content.len(), output_height, pane.scroll);
+    let lines = content[start..end].iter().cloned().collect::<Vec<_>>();
     frame.render_widget(
         Paragraph::new(lines).wrap(Wrap { trim: false }).block(
             Block::default()
@@ -1210,9 +1367,9 @@ fn render_python_pane(frame: &mut Frame, pane: &PythonPane, area: Rect, active: 
     render_vertical_scrollbar(
         frame,
         area,
-        pane.output.len(),
+        content.len(),
         pane.visible_output_lines,
-        python_scrollbar_position(pane.output.len(), pane.visible_output_lines, pane.scroll),
+        python_scrollbar_position(content.len(), pane.visible_output_lines, pane.scroll),
         if active {
             Color::LightGreen
         } else {
@@ -1245,7 +1402,11 @@ fn render_vertical_scrollbar(
         return;
     }
     let mut state = ScrollbarState::new(content_length)
-        .position(position)
+        .position(scrollbar_state_position(
+            content_length,
+            viewport_length,
+            position,
+        ))
         .viewport_content_length(viewport_length);
     let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
         .begin_symbol(Some("↑"))
@@ -1263,16 +1424,33 @@ fn render_vertical_scrollbar(
     );
 }
 
+fn scrollbar_state_position(
+    content_length: usize,
+    viewport_length: usize,
+    position: usize,
+) -> usize {
+    let max_scroll = content_length.saturating_sub(viewport_length);
+    if max_scroll == 0 {
+        0
+    } else {
+        position
+            .min(max_scroll)
+            .saturating_mul(content_length.saturating_sub(1))
+            / max_scroll
+    }
+}
+
 fn render_help_modal(frame: &mut Frame, help: &HelpViewer) {
     let area = centered_rect(
         frame.area(),
-        92,
-        frame.area().height.saturating_sub(4).min(34),
+        96,
+        frame.area().height.saturating_sub(4).min(36),
     );
     frame.render_widget(Clear, area);
     let lines = keybinding_lines();
+    let line_count = lines.len();
     let visible_height = area.height.saturating_sub(2) as usize;
-    let max_scroll = lines.len().saturating_sub(visible_height);
+    let max_scroll = line_count.saturating_sub(visible_height);
     let scroll = help.scroll.min(max_scroll);
     frame.render_widget(
         Paragraph::new(lines)
@@ -1280,33 +1458,63 @@ fn render_help_modal(frame: &mut Frame, help: &HelpViewer) {
             .block(
                 Block::default()
                     .title(Span::styled(
-                        " Keybindings - keys or mouse wheel scroll; Esc/?/q closes ",
+                        " Help: keyboard and mouse reference — scroll with arrows, PgUp/PgDn, or wheel; Esc/?/q closes ",
                         modal_title_style(),
                     ))
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::Cyan)),
-            ),
+        ),
         area,
     );
+    render_vertical_scrollbar(frame, area, line_count, visible_height, scroll, Color::Cyan);
 }
 
 fn keybinding_lines() -> Vec<Line<'static>> {
     let section = |title| {
-        Line::styled(
-            title,
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )
+        Line::from(vec![
+            Span::styled(
+                format!("  {title}  "),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                " ─────────────────────────",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])
     };
     let binding = |keys: &'static str, action: &'static str| {
         Line::from(vec![
-            Span::styled(format!("  {keys:<24}"), Style::default().fg(Color::Cyan)),
-            Span::raw(action),
+            Span::raw("  "),
+            Span::styled(
+                format!(" {keys} "),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  —  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(action, Style::default().fg(Color::White)),
         ])
     };
 
     vec![
+        Line::from(vec![
+            Span::styled(
+                "  QUICK TIP  ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::LightGreen)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "highlighted keys and their action stay together on each row",
+                Style::default().fg(Color::Gray),
+            ),
+        ]),
+        Line::from(""),
         section("Workspace"),
         binding("Ctrl+B, then Right", "activate the next binary"),
         binding("Ctrl+B, then Left", "activate the previous binary"),
@@ -1315,7 +1523,10 @@ fn keybinding_lines() -> Vec<Line<'static>> {
         binding("Ctrl+W", "close the active binary (twice if unsaved)"),
         binding("Ctrl+D", "toggle byte diff mode"),
         binding("Ctrl+Z", "suspend on Unix; resume with shell fg"),
-        binding("e", "toggle the active binary's entropy graph"),
+        binding(
+            "e / Esc",
+            "show / hide entropy; calculations run in the background",
+        ),
         binding("mouse on tab/pane", "activate that binary"),
         Line::from(""),
         section("View Mode"),
@@ -1327,6 +1538,10 @@ fn keybinding_lines() -> Vec<Line<'static>> {
             "jump to the start / end of the file",
         ),
         binding("mouse drag", "select a range of bytes"),
+        binding(
+            "Ctrl + mouse drag",
+            "add a separate byte range (mouse-only; no shell keybinding conflict)",
+        ),
         binding("mouse wheel", "scroll the hex viewer"),
         binding("i", "enter Overwrite Mode"),
         binding("Ctrl+F", "open byte-pattern search"),
@@ -1335,7 +1550,7 @@ fn keybinding_lines() -> Vec<Line<'static>> {
         binding("Ctrl+G", "jump to a decimal or hexadecimal offset"),
         binding(
             "Ctrl+C / Ctrl+Shift+C",
-            "copy the selection as continuous hexadecimal",
+            "copy every selected range as continuous hexadecimal",
         ),
         binding("Ctrl+U / Ctrl+R", "undo / redo byte overwrites"),
         binding("Ctrl+S", "save the edited binary"),
@@ -1378,7 +1593,10 @@ fn keybinding_lines() -> Vec<Line<'static>> {
         binding("Ctrl+R", "reset theme or settings after y/n confirmation"),
         Line::from(""),
         section("Python console"),
-        binding("Enter", "execute an expression or statement"),
+        binding(
+            "Enter",
+            "execute; blank input adds a prompt or finishes a multi-line block",
+        ),
         binding("Up / Down", "previous / next Python command"),
         binding("Ctrl+C", "interrupt the running Python command"),
         binding("Tab / Shift+Tab", "cycle viewer, fields, and Python panes"),
@@ -1386,6 +1604,10 @@ fn keybinding_lines() -> Vec<Line<'static>> {
         binding("PgUp/PgDn / wheel", "scroll console output"),
         binding("Ctrl+Home / Ctrl+End", "oldest / newest console output"),
         binding("Ctrl+L", "clear console output"),
+        binding(
+            "viewer: i / Esc",
+            "enter/leave hex overwrite mode without closing Python",
+        ),
         binding("Escape", "close the Python pane"),
         Line::from(""),
         section("General"),
@@ -1520,6 +1742,12 @@ mod tests {
     fn python_scrollbar_position_uses_top_based_coordinates() {
         assert_eq!(python_scrollbar_position(100, 20, 0), 80);
         assert_eq!(python_scrollbar_position(100, 20, 80), 0);
+    }
+
+    #[test]
+    fn scrollbar_thumb_reaches_the_end_of_scrolled_content() {
+        assert_eq!(scrollbar_state_position(100, 20, 0), 0);
+        assert_eq!(scrollbar_state_position(100, 20, 80), 99);
     }
 
     #[test]
@@ -1690,8 +1918,23 @@ mod tests {
                     output.push_str(cell.symbol());
                     output
                 });
-        assert!(rendered.contains("Keybindings"));
+        assert!(rendered.contains("Help:"));
         assert!(rendered.contains("Ctrl+F"));
         assert!(rendered.contains("Overwrite Mode"));
+    }
+
+    #[test]
+    fn help_keeps_each_keybinding_next_to_its_action() {
+        let line = keybinding_lines()
+            .into_iter()
+            .find(|line| {
+                line.spans
+                    .iter()
+                    .any(|span| span.content.as_ref() == " Ctrl+F ")
+            })
+            .expect("search shortcut should be listed");
+
+        assert_eq!(line.spans.len(), 4);
+        assert_eq!(line.spans[3].content.as_ref(), "open byte-pattern search");
     }
 }
