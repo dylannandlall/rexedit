@@ -39,6 +39,7 @@ pub fn spawn(bytes: Arc<Vec<u8>>) -> EntropyWorker {
     EntropyWorker { receiver, cancel }
 }
 
+#[cfg(test)]
 pub fn calculate(bytes: &[u8]) -> Vec<f64> {
     let (sender, _receiver) = mpsc::channel();
     calculate_entropy(bytes, &sender, &AtomicBool::new(false))
