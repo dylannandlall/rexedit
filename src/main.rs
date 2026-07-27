@@ -59,7 +59,7 @@ Workspace:
   e                 toggle active-binary entropy graph
 
 View Mode:
-  i                 enter Overwrite Mode
+  i                 enter byte edit mode (Overwrite initially)
   s                 open viewer settings
   t                 open theme customization
   p                 open the Python buffer console
@@ -68,16 +68,18 @@ View Mode:
   Ctrl+G            jump to an offset
   Ctrl+C            copy the selection as continuous hexadecimal
   gg / G            jump to the start / end of the file
-  Ctrl+U / Ctrl+R   undo / redo a byte overwrite
+  Ctrl+U / Ctrl+R   undo / redo byte edits
   Ctrl+S            save the edited binary
-  Ctrl+O / Ctrl+L   save / load an overlay
+  Ctrl+O / Ctrl+L   save / load an overlay (auto-saved per file)
   o                 toggle field overlays
   Ctrl+R            reset an open theme/settings menu with y/n confirmation
   Ctrl+Z            suspend to the shell on Unix (resume with fg)
 
-Overwrite Mode:
-  hexadecimal keys  overwrite the selected byte
-  Ctrl+U / Ctrl+R   undo / redo a byte overwrite
+Byte Edit Mode:
+  hexadecimal keys  edit a byte using two hexadecimal digits
+  Insert            switch between Overwrite and Insert Mode
+  Backspace/Delete  delete the selected byte range
+  Ctrl+U / Ctrl+R   undo / redo overwrite, insertion, or deletion
   Ctrl+S            save the edited binary
   Escape            return to View Mode
 

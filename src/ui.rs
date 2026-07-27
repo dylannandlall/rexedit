@@ -16,6 +16,12 @@ use crate::app::{
     ThemeEditor, Workspace,
 };
 
+// A 16-byte row with offsets and ASCII needs 77 inner columns. Leave room for
+// both viewer borders so the sidebar border never overwrites the final ASCII
+// character when the terminal is narrowed.
+const VIEWER_MIN_WIDTH: u16 = 79;
+const SIDEBAR_WIDTH: u16 = 41;
+
 pub fn render_workspace(frame: &mut Frame, workspace: &mut Workspace) {
     let [tabs, content] =
         Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(frame.area());
@@ -51,7 +57,27 @@ pub fn render_workspace(frame: &mut Frame, workspace: &mut Workspace) {
             } else {
                 (content, None)
             };
+        let show_sidebar = workspace.documents[active].settings.show_sidebar;
+        let (comparison, sidebar) = if show_sidebar {
+            let (comparison, sidebar) = split_viewer_and_sidebar(comparison);
+            (comparison, Some(sidebar))
+        } else {
+            (comparison, None)
+        };
         render_comparison(frame, workspace, comparison);
+        if let Some(sidebar) = sidebar {
+            let [fields, inspector] =
+                Layout::vertical([Constraint::Percentage(45), Constraint::Percentage(55)])
+                    .areas(sidebar);
+            let app = &mut workspace.documents[active];
+            app.fields_area = fields;
+            app.visible_fields = fields.height.saturating_sub(5).max(1) as usize;
+            app.fields_scroll = app.fields_scroll.min(app.field_max_scroll());
+            render_fields(frame, app, fields);
+            render_inspector(frame, app, inspector);
+        } else {
+            workspace.documents[active].fields_area = Rect::default();
+        }
         if let Some(area) = python_area {
             let app = &mut workspace.documents[active];
             app.python_area = area;
@@ -110,8 +136,7 @@ fn render_in(frame: &mut Frame, app: &mut App, area: Rect) {
         (body, None)
     };
     let (viewer, fields, inspector) = if app.settings.show_sidebar {
-        let [viewer, sidebar] =
-            Layout::horizontal([Constraint::Min(78), Constraint::Length(42)]).areas(body);
+        let (viewer, sidebar) = split_viewer_and_sidebar(body);
         let [fields, inspector] =
             Layout::vertical([Constraint::Percentage(45), Constraint::Percentage(55)])
                 .areas(sidebar);
@@ -143,6 +168,19 @@ fn render_in(frame: &mut Frame, app: &mut App, area: Rect) {
     render_status(frame, app, status);
 
     render_mode_modal(frame, app);
+}
+
+fn split_viewer_and_sidebar(area: Rect) -> (Rect, Rect) {
+    let [viewer, sidebar] = Layout::horizontal([
+        Constraint::Min(VIEWER_MIN_WIDTH),
+        Constraint::Length(SIDEBAR_WIDTH),
+    ])
+    .areas(area);
+    // Keep the sidebar's lower edge exactly level with the viewer. This also
+    // protects against future layout changes that reserve space below only one
+    // of the two panes.
+    let sidebar = Rect::new(sidebar.x, viewer.y, sidebar.width, viewer.height);
+    (viewer, sidebar)
 }
 
 fn render_mode_modal(frame: &mut Frame, app: &App) {
@@ -228,12 +266,6 @@ fn render_comparison(frame: &mut Frame, workspace: &mut Workspace, area: Rect) {
     let active = workspace.active;
     let comparison = workspace.comparison_index();
     let active_bytes = workspace.documents[active].bytes.clone();
-    let active_scroll = workspace.documents[active].scroll;
-    let active_row_width = workspace.documents[active].settings.bytes_per_row;
-    let active_top_offset = workspace.documents[active]
-        .display_rows
-        .get(active_scroll)
-        .map_or(0, |row| row.start());
     let comparison_bytes = comparison.map(|index| workspace.documents[index].bytes.clone());
 
     for (index, pane) in panes.iter().enumerate() {
@@ -247,12 +279,9 @@ fn render_comparison(frame: &mut Frame, workspace: &mut Workspace, area: Rect) {
             None
         };
         let document = &mut workspace.documents[index];
-        document.set_bytes_per_row(active_row_width);
         document.viewer_area = *pane;
         document.visible_rows = pane.height.saturating_sub(2) as usize;
-        document.scroll = document
-            .display_row_for_offset(active_top_offset)
-            .min(document.max_scroll());
+        document.scroll = document.scroll.min(document.max_scroll());
         let name = document
             .path
             .file_name()
@@ -530,13 +559,14 @@ fn render_viewer(
     }
 
     let mode_name = if app.edit_mode {
-        "Overwrite Mode"
+        format!("{} Mode", app.edit_kind.name())
     } else {
-        "View Mode"
+        "View Mode".into()
     };
+    let selection = selection_location_summary(app);
     let title = label.map_or_else(
-        || format!(" Hex Viewer - {mode_name} "),
-        |label| format!(" {label} - {mode_name} "),
+        || format!(" Hex Viewer - {mode_name} | {selection} "),
+        |label| format!(" {label} - {mode_name} | {selection} "),
     );
     frame.render_widget(
         Paragraph::new(Text::from(lines)).block(
@@ -845,6 +875,23 @@ fn kv(label: &str, value: String) -> Line<'static> {
     ])
 }
 
+fn selection_location_summary(app: &App) -> String {
+    let Some(selection) = app.selection else {
+        return "no byte selected".into();
+    };
+    if selection.start() == selection.end() {
+        return format!("0x{:X} ({})", selection.cursor, selection.cursor);
+    }
+    format!(
+        "0x{:X} to 0x{:X} ({} to {}, {} bytes)",
+        selection.start(),
+        selection.end(),
+        selection.start(),
+        selection.end(),
+        selection.len()
+    )
+}
+
 fn render_status(frame: &mut Frame, app: &App, area: Rect) {
     let dirty = if app.modified_offsets.is_empty() {
         String::new()
@@ -874,9 +921,9 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
         )
     };
     let mode = if app.edit_mode {
-        " | Overwrite Mode"
+        format!(" | {} Mode", app.edit_kind.name())
     } else {
-        " | View Mode"
+        " | View Mode".into()
     };
     let first = Line::from(vec![
         Span::styled(
@@ -884,14 +931,15 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().add_modifier(Modifier::BOLD),
         ),
         Span::raw(format!(
-            "| {} bytes | {} fields{dirty}{search}{mode}",
+            "| {} bytes | {} fields | {}{dirty}{search}{mode}",
             app.bytes.len(),
             app.fields.len(),
+            selection_location_summary(app),
         )),
     ]);
     let second = Line::styled(&app.status, Style::default().fg(Color::Cyan));
     let help = if app.edit_mode {
-        "Ctrl+B then Left/Right binary | hex overwrite | Ctrl+U/R undo/redo | Ctrl+S save | Esc View Mode | ? keybinds"
+        "Ctrl+B then Left/Right binary | Insert switches overwrite/insert | Del removes selection | Ctrl+U/R undo/redo | Ctrl+S save | Esc View Mode | ? keybinds"
     } else {
         "Ctrl+B then Left/Right binary, S compare | Ctrl+U/R undo/redo | Ctrl+S save | Ctrl+F search | i edit | ? keybinds"
     };
@@ -936,7 +984,15 @@ fn render_path_modal(frame: &mut Frame, dialog: &PathDialog) {
         PathAction::SaveTheme => (" Save theme ", "Save this custom theme as JSON."),
         PathAction::LoadTheme => (" Load theme ", "Enter the path to a theme JSON file."),
     };
-    render_input_modal(frame, title, &dialog.input, help);
+    render_path_completion_modal(
+        frame,
+        title,
+        &dialog.input,
+        &dialog.suggestions,
+        dialog.active_suggestion,
+        dialog.suggestion_scroll,
+        help,
+    );
 }
 
 fn render_open_file_modal(frame: &mut Frame, dialog: &OpenFileDialog) {
@@ -994,6 +1050,26 @@ fn render_manual_path_modal(
     active_suggestion: Option<usize>,
     suggestion_scroll: usize,
 ) {
+    render_path_completion_modal(
+        frame,
+        " Open binary by path ",
+        input,
+        suggestions,
+        active_suggestion,
+        suggestion_scroll,
+        "Type a full or relative binary path.",
+    );
+}
+
+fn render_path_completion_modal(
+    frame: &mut Frame,
+    title: &str,
+    input: &crate::app::TextInput,
+    suggestions: &[std::path::PathBuf],
+    active_suggestion: Option<usize>,
+    suggestion_scroll: usize,
+    help: &str,
+) {
     let suggestion_lines = suggestions.len().min(PATH_SUGGESTION_PAGE_SIZE) as u16;
     let area = centered_rect(frame.area(), 78, 7 + suggestion_lines);
     frame.render_widget(Clear, area);
@@ -1043,14 +1119,16 @@ fn render_manual_path_modal(
     lines.extend([
         Line::from(""),
         Line::styled(
-            "Tab/Up/Down select | PgUp/PgDn scroll | Enter open | mouse wheel scroll",
+            format!(
+                "{help} Tab/Up/Down select | PgUp/PgDn scroll | Enter confirm | mouse wheel scroll"
+            ),
             Style::default().fg(Color::DarkGray),
         ),
     ]);
     frame.render_widget(
         Paragraph::new(lines).block(
             Block::default()
-                .title(Span::styled(" Open binary by path ", modal_title_style()))
+                .title(Span::styled(title, modal_title_style()))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Cyan)),
         ),
@@ -1339,7 +1417,7 @@ fn render_python_pane(frame: &mut Frame, pane: &PythonPane, area: Rect, active: 
     }
     content.push(Line::from(input_spans));
     let (start, end) = python_output_range(content.len(), output_height, pane.scroll);
-    let lines = content[start..end].iter().cloned().collect::<Vec<_>>();
+    let lines = content[start..end].to_vec();
     frame.render_widget(
         Paragraph::new(lines).wrap(Wrap { trim: false }).block(
             Block::default()
@@ -1430,14 +1508,11 @@ fn scrollbar_state_position(
     position: usize,
 ) -> usize {
     let max_scroll = content_length.saturating_sub(viewport_length);
-    if max_scroll == 0 {
-        0
-    } else {
-        position
-            .min(max_scroll)
-            .saturating_mul(content_length.saturating_sub(1))
-            / max_scroll
-    }
+    position
+        .min(max_scroll)
+        .saturating_mul(content_length.saturating_sub(1))
+        .checked_div(max_scroll)
+        .unwrap_or_default()
 }
 
 fn render_help_modal(frame: &mut Frame, help: &HelpViewer) {
@@ -1543,7 +1618,7 @@ fn keybinding_lines() -> Vec<Line<'static>> {
             "add a separate byte range (mouse-only; no shell keybinding conflict)",
         ),
         binding("mouse wheel", "scroll the hex viewer"),
-        binding("i", "enter Overwrite Mode"),
+        binding("i", "enter byte edit mode (Overwrite initially)"),
         binding("Ctrl+F", "open byte-pattern search"),
         binding("n / N", "next / previous search result"),
         binding("Ctrl+Down / Ctrl+Up", "next / previous search result"),
@@ -1552,26 +1627,41 @@ fn keybinding_lines() -> Vec<Line<'static>> {
             "Ctrl+C / Ctrl+Shift+C",
             "copy every selected range as continuous hexadecimal",
         ),
-        binding("Ctrl+U / Ctrl+R", "undo / redo byte overwrites"),
+        binding("Ctrl+U / Ctrl+R", "undo / redo byte edits"),
         binding("Ctrl+S", "save the edited binary"),
         binding("a", "create a field from the current selection"),
         binding("Tab", "switch between viewer and fields pane"),
         binding("Enter", "edit the selected field"),
         binding("d", "delete the selected field"),
         binding("[ / ]", "select previous / next field"),
-        binding("Ctrl+O / Ctrl+L", "save / load a field overlay"),
+        binding(
+            "Ctrl+O / Ctrl+L",
+            "save / load a field overlay (auto-saved per file)",
+        ),
         binding("o", "toggle field overlays"),
         binding("s", "open viewer settings"),
         binding("t", "open theme customization"),
         binding("p", "open the Python buffer console"),
         Line::from(""),
-        section("Overwrite Mode"),
+        section("Byte Edit Mode"),
         binding("0-9, A-F", "overwrite the selected byte, two nibbles"),
+        binding("Insert", "toggle between Overwrite and Insert Mode"),
+        binding(
+            "0-9, A-F in Insert",
+            "insert a byte at the cursor, two nibbles",
+        ),
+        binding(
+            "Backspace / Delete",
+            "delete the current selected byte range",
+        ),
         binding(
             "arrows / Page Up/Down",
-            "navigate without leaving overwrite mode",
+            "navigate without leaving byte edit mode",
         ),
-        binding("Ctrl+U / Ctrl+R", "undo / redo byte overwrites"),
+        binding(
+            "Ctrl+U / Ctrl+R",
+            "undo / redo overwrite, insertion, or deletion",
+        ),
         binding("Ctrl+S", "save the edited binary"),
         binding("Escape", "return to View Mode"),
         Line::from(""),
@@ -1584,7 +1674,14 @@ fn keybinding_lines() -> Vec<Line<'static>> {
         binding("re:\\x4D\\x5A.", "byte regular expression"),
         Line::from(""),
         section("Dialogs, themes, and settings"),
-        binding("Tab / Up / Down", "move between dialog options"),
+        binding(
+            "Tab / Up / Down",
+            "complete and select filesystem paths in path dialogs",
+        ),
+        binding(
+            "PgUp / PgDn / wheel",
+            "scroll filesystem completion choices",
+        ),
         binding("Left / Right / Space", "change the selected option"),
         binding("Ctrl+U", "clear a text input"),
         binding("Enter", "confirm or close"),
@@ -1606,7 +1703,7 @@ fn keybinding_lines() -> Vec<Line<'static>> {
         binding("Ctrl+L", "clear console output"),
         binding(
             "viewer: i / Esc",
-            "enter/leave hex overwrite mode without closing Python",
+            "enter/leave hex edit mode without closing Python",
         ),
         binding("Escape", "close the Python pane"),
         Line::from(""),
@@ -1719,6 +1816,14 @@ mod tests {
     fn truncates_long_labels() {
         assert_eq!(truncate("abcdefghijkl", 6), "abcde…");
         assert_eq!(truncate("abc", 6), "abc");
+    }
+
+    #[test]
+    fn sidebar_leaves_room_for_ascii_and_ends_with_the_viewer() {
+        let (viewer, sidebar) = split_viewer_and_sidebar(Rect::new(0, 0, 120, 36));
+        assert_eq!(viewer.width, VIEWER_MIN_WIDTH);
+        assert_eq!(sidebar.width, SIDEBAR_WIDTH);
+        assert_eq!(viewer.bottom(), sidebar.bottom());
     }
 
     #[test]
@@ -1855,6 +1960,27 @@ mod tests {
         assert!(rendered.contains("two.bin"));
         assert!(rendered.contains("DIFF"));
         assert!(rendered.contains("Entropy"));
+        assert!(rendered.contains("Inspector"));
+    }
+
+    #[test]
+    fn side_by_side_keeps_each_document_scroll_position() {
+        let backend = TestBackend::new(180, 42);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut workspace = Workspace::new(vec![
+            App::new(PathBuf::from("one.bin"), vec![0; 4096]),
+            App::new(PathBuf::from("two.bin"), vec![1; 4096]),
+        ]);
+        workspace.side_by_side = true;
+        workspace.documents[0].scroll = 7;
+        workspace.documents[1].scroll = 23;
+
+        terminal
+            .draw(|frame| render_workspace(frame, &mut workspace))
+            .unwrap();
+
+        assert_eq!(workspace.documents[0].scroll, 7);
+        assert_eq!(workspace.documents[1].scroll, 23);
     }
 
     #[test]
@@ -1900,7 +2026,7 @@ mod tests {
 
     #[test]
     fn renders_complete_keybinding_help() {
-        let backend = TestBackend::new(120, 40);
+        let backend = TestBackend::new(120, 80);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut workspace =
             Workspace::new(vec![App::new(PathBuf::from("sample.bin"), vec![0; 64])]);
@@ -1920,7 +2046,11 @@ mod tests {
                 });
         assert!(rendered.contains("Help:"));
         assert!(rendered.contains("Ctrl+F"));
-        assert!(rendered.contains("Overwrite Mode"));
+        assert!(keybinding_lines().iter().any(|line| {
+            line.spans
+                .iter()
+                .any(|span| span.content.as_ref().contains("Byte Edit Mode"))
+        }));
     }
 
     #[test]

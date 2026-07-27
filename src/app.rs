@@ -14,6 +14,9 @@ use std::{io::Write, process::Stdio};
 #[cfg(not(windows))]
 use std::{io::Write, process::Stdio};
 
+#[cfg(not(windows))]
+use std::time::Instant;
+
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
@@ -69,6 +72,9 @@ pub const PATH_SUGGESTION_PAGE_SIZE: usize = 12;
 pub struct PathDialog {
     pub action: PathAction,
     pub input: TextInput,
+    pub suggestions: Vec<PathBuf>,
+    pub active_suggestion: Option<usize>,
+    pub suggestion_scroll: usize,
 }
 
 #[derive(Debug)]
@@ -104,7 +110,7 @@ pub enum ResetTarget {
     Settings,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct TextInput {
     pub value: String,
     cursor: usize,
@@ -212,16 +218,6 @@ impl TextInput {
         let end = self.byte_index(self.cursor);
         self.value.replace_range(start..end, "");
         self.cursor -= 1;
-    }
-}
-
-impl Default for TextInput {
-    fn default() -> Self {
-        Self {
-            value: String::new(),
-            cursor: 0,
-            selected: false,
-        }
     }
 }
 
@@ -382,17 +378,50 @@ impl DisplayRow {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct EditAction {
-    offset: usize,
-    before: u8,
-    after: u8,
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EditKind {
+    #[default]
+    Overwrite,
+    Insert,
+}
+
+impl EditKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Overwrite => "Overwrite",
+            Self::Insert => "Insert",
+        }
+    }
+
+    fn toggle(self) -> Self {
+        match self {
+            Self::Overwrite => Self::Insert,
+            Self::Insert => Self::Overwrite,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum EditAction {
+    Overwrite {
+        offset: usize,
+        before: u8,
+        after: u8,
+    },
+    Insert {
+        offset: usize,
+        byte: u8,
+    },
+    Delete {
+        offset: usize,
+        bytes: Vec<u8>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct PendingEdit {
-    offset: usize,
-    before: u8,
+enum PendingEdit {
+    Overwrite { offset: usize, before: u8 },
+    Insert { offset: usize, high_nibble: u8 },
 }
 
 #[derive(Default)]
@@ -431,7 +460,9 @@ pub struct App {
     pub display_rows: Vec<DisplayRow>,
     python_history: Vec<String>,
     pub edit_mode: bool,
+    pub edit_kind: EditKind,
     pub edit_high_nibble: bool,
+    insert_at_end: bool,
     pub modified_offsets: BTreeSet<usize>,
     undo_stack: Vec<EditAction>,
     redo_stack: Vec<EditAction>,
@@ -473,7 +504,9 @@ impl App {
             display_rows: Vec::new(),
             python_history: Vec::new(),
             edit_mode: false,
+            edit_kind: EditKind::Overwrite,
             edit_high_nibble: true,
+            insert_at_end: false,
             modified_offsets: BTreeSet::new(),
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
@@ -487,10 +520,20 @@ impl App {
             entropy_scanned: 0,
             entropy_total: 0,
         };
+        if app.path.is_file() {
+            match app.restore_automatic_overlay() {
+                Ok(true) => {
+                    app.status = format!("Restored {} saved overlay field(s)", app.fields.len());
+                }
+                Ok(false) => {}
+                Err(error) => app.status = format!("Could not restore saved overlay: {error}"),
+            }
+        }
         app.rebuild_display_rows();
         app
     }
 
+    #[cfg(test)]
     pub fn entropy_profile(&mut self) -> &[f64] {
         self.entropy
             .get_or_insert_with(|| entropy::calculate(&self.bytes))
@@ -540,6 +583,50 @@ impl App {
         self.entropy = None;
         self.entropy_scanned = 0;
         self.entropy_total = 0;
+    }
+
+    fn automatic_overlay_path(&self) -> PathBuf {
+        overlay_storage_dir().join(format!("{}.json", content_identity(&self.saved_bytes)))
+    }
+
+    fn restore_automatic_overlay(&mut self) -> Result<bool, String> {
+        let path = self.automatic_overlay_path();
+        if !path.is_file() {
+            return Ok(false);
+        }
+        self.load_overlay_from(&path)?;
+        Ok(true)
+    }
+
+    fn persist_automatic_overlay(&self) -> Result<Option<PathBuf>, String> {
+        if !self.path.is_file() {
+            return Ok(None);
+        }
+        let path = self.automatic_overlay_path();
+        if self.fields.is_empty() && !path.is_file() {
+            return Ok(None);
+        }
+        let parent = path
+            .parent()
+            .ok_or_else(|| "Could not determine the overlay storage directory".to_string())?;
+        fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "Could not create overlay storage directory {}: {error}",
+                parent.display()
+            )
+        })?;
+        self.save_overlay_to(&path)?;
+        Ok(Some(path))
+    }
+
+    fn save_automatic_overlay_after_change(&mut self) {
+        match self.persist_automatic_overlay() {
+            Ok(Some(path)) => {
+                self.status = format!("{}; overlay saved to {}", self.status, path.display());
+            }
+            Ok(None) => {}
+            Err(error) => self.status = format!("{}; {error}", self.status),
+        }
     }
 }
 
@@ -617,6 +704,7 @@ impl Workspace {
                         continue;
                     }
                     if self.handle_workspace_key(key)? {
+                        self.persist_all_automatic_overlays();
                         for document in &mut self.documents {
                             document.cancel_search();
                         }
@@ -1114,6 +1202,10 @@ impl Workspace {
             return;
         }
         self.active_mut().invalidate_entropy();
+        if let Err(error) = self.active().persist_automatic_overlay() {
+            self.status = error;
+            return;
+        }
         let path = self.documents.remove(self.active).path;
         if self.documents.is_empty() {
             self.active = 0;
@@ -1130,6 +1222,15 @@ impl Workspace {
             self.comparison_panes.clear();
         }
         self.status = format!("Closed {}", path.display());
+    }
+
+    fn persist_all_automatic_overlays(&mut self) {
+        for document in &self.documents {
+            if let Err(error) = document.persist_automatic_overlay() {
+                self.status = error;
+                break;
+            }
+        }
     }
 
     fn open_binary_path(&mut self, path: PathBuf) -> Result<(), String> {
@@ -1414,7 +1515,9 @@ impl App {
             }
             KeyCode::Char('i') if self.focus == Focus::Viewer => {
                 self.edit_mode = true;
+                self.edit_kind = EditKind::Overwrite;
                 self.edit_high_nibble = true;
+                self.insert_at_end = false;
                 self.status =
                     "Overwrite Mode: type two hex digits per byte; Esc returns to View Mode".into();
             }
@@ -1507,7 +1610,9 @@ impl App {
             KeyCode::Esc => {
                 self.commit_pending_edit();
                 self.edit_mode = false;
+                self.edit_kind = EditKind::Overwrite;
                 self.edit_high_nibble = true;
+                self.insert_at_end = false;
                 self.status = "View Mode".into();
             }
             KeyCode::Char('q') => {
@@ -1519,9 +1624,11 @@ impl App {
                     return Ok(true);
                 }
             }
+            KeyCode::Insert => self.toggle_edit_kind(),
+            KeyCode::Backspace | KeyCode::Delete => self.delete_selected_bytes(),
             KeyCode::Char(character) if character.is_ascii_hexdigit() => {
                 let nibble = character.to_digit(16).expect("checked hex digit") as u8;
-                self.overwrite_nibble(nibble);
+                self.edit_nibble(nibble);
             }
             KeyCode::Left => {
                 self.commit_pending_edit();
@@ -1671,7 +1778,101 @@ impl App {
     fn handle_path_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc => self.mode = Mode::Normal,
+            KeyCode::Tab => {
+                if let Mode::Path(dialog) = &mut self.mode {
+                    Workspace::complete_manual_path(
+                        &mut dialog.input,
+                        &mut dialog.suggestions,
+                        &mut dialog.active_suggestion,
+                        &mut dialog.suggestion_scroll,
+                    );
+                }
+            }
+            KeyCode::Down if matches!(&self.mode, Mode::Path(dialog) if !dialog.suggestions.is_empty()) => {
+                if let Mode::Path(dialog) = &mut self.mode {
+                    Workspace::move_suggestion(
+                        &mut dialog.input,
+                        &dialog.suggestions,
+                        &mut dialog.active_suggestion,
+                        &mut dialog.suggestion_scroll,
+                        1,
+                    );
+                }
+            }
+            KeyCode::Up if matches!(&self.mode, Mode::Path(dialog) if !dialog.suggestions.is_empty()) => {
+                if let Mode::Path(dialog) = &mut self.mode {
+                    Workspace::move_suggestion(
+                        &mut dialog.input,
+                        &dialog.suggestions,
+                        &mut dialog.active_suggestion,
+                        &mut dialog.suggestion_scroll,
+                        -1,
+                    );
+                }
+            }
+            KeyCode::PageDown if matches!(&self.mode, Mode::Path(dialog) if !dialog.suggestions.is_empty()) => {
+                if let Mode::Path(dialog) = &mut self.mode {
+                    Workspace::move_suggestion(
+                        &mut dialog.input,
+                        &dialog.suggestions,
+                        &mut dialog.active_suggestion,
+                        &mut dialog.suggestion_scroll,
+                        PATH_SUGGESTION_PAGE_SIZE as isize,
+                    );
+                }
+            }
+            KeyCode::PageUp if matches!(&self.mode, Mode::Path(dialog) if !dialog.suggestions.is_empty()) => {
+                if let Mode::Path(dialog) = &mut self.mode {
+                    Workspace::move_suggestion(
+                        &mut dialog.input,
+                        &dialog.suggestions,
+                        &mut dialog.active_suggestion,
+                        &mut dialog.suggestion_scroll,
+                        -(PATH_SUGGESTION_PAGE_SIZE as isize),
+                    );
+                }
+            }
+            KeyCode::Home if matches!(&self.mode, Mode::Path(dialog) if !dialog.suggestions.is_empty()) => {
+                if let Mode::Path(dialog) = &mut self.mode {
+                    Workspace::select_suggestion(
+                        &mut dialog.input,
+                        &dialog.suggestions,
+                        &mut dialog.active_suggestion,
+                        &mut dialog.suggestion_scroll,
+                        0,
+                    );
+                }
+            }
+            KeyCode::End if matches!(&self.mode, Mode::Path(dialog) if !dialog.suggestions.is_empty()) => {
+                if let Mode::Path(dialog) = &mut self.mode {
+                    let last = dialog.suggestions.len() - 1;
+                    Workspace::select_suggestion(
+                        &mut dialog.input,
+                        &dialog.suggestions,
+                        &mut dialog.active_suggestion,
+                        &mut dialog.suggestion_scroll,
+                        last,
+                    );
+                }
+            }
             KeyCode::Enter => {
+                let selected_directory = match &self.mode {
+                    Mode::Path(dialog) => dialog
+                        .active_suggestion
+                        .and_then(|index| dialog.suggestions.get(index))
+                        .filter(|path| path.is_dir())
+                        .cloned(),
+                    _ => None,
+                };
+                if let Some(path) = selected_directory {
+                    if let Mode::Path(dialog) = &mut self.mode {
+                        dialog.input.set_value(completion_display_path(&path));
+                        dialog.suggestions.clear();
+                        dialog.active_suggestion = None;
+                        dialog.suggestion_scroll = 0;
+                    }
+                    return;
+                }
                 let (action, value) = match &self.mode {
                     Mode::Path(dialog) => (dialog.action, dialog.input.value.clone()),
                     _ => return,
@@ -1681,6 +1882,9 @@ impl App {
             _ => {
                 if let Mode::Path(dialog) = &mut self.mode {
                     dialog.input.handle_key(key);
+                    dialog.suggestions.clear();
+                    dialog.active_suggestion = None;
+                    dialog.suggestion_scroll = 0;
                 }
             }
         }
@@ -1833,7 +2037,9 @@ impl App {
             if self.focus == Focus::Viewer && self.edit_mode {
                 self.commit_pending_edit();
                 self.edit_mode = false;
+                self.edit_kind = EditKind::Overwrite;
                 self.edit_high_nibble = true;
+                self.insert_at_end = false;
                 self.status = "Python mode: hex View Mode".into();
                 return;
             }
@@ -2012,7 +2218,9 @@ impl App {
         match (self.focus, key.code) {
             (Focus::Viewer, KeyCode::Char('i')) => {
                 self.edit_mode = true;
+                self.edit_kind = EditKind::Overwrite;
                 self.edit_high_nibble = true;
+                self.insert_at_end = false;
                 self.status = "Python mode: hex Overwrite Mode (Esc returns to View Mode)".into();
             }
             (Focus::Viewer, KeyCode::Left) => {
@@ -2068,8 +2276,10 @@ impl App {
             return;
         }
         match key.code {
+            KeyCode::Insert => self.toggle_edit_kind(),
+            KeyCode::Backspace | KeyCode::Delete => self.delete_selected_bytes(),
             KeyCode::Char(character) if character.is_ascii_hexdigit() => {
-                self.overwrite_nibble(character.to_digit(16).expect("hex digit") as u8)
+                self.edit_nibble(character.to_digit(16).expect("hex digit") as u8)
             }
             KeyCode::Left => {
                 self.commit_pending_edit();
@@ -2258,6 +2468,23 @@ impl App {
             }
             return;
         }
+        if let Mode::Path(dialog) = &mut self.mode {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => {
+                    dialog.suggestion_scroll = dialog.suggestion_scroll.saturating_sub(3);
+                }
+                MouseEventKind::ScrollDown => {
+                    let max_scroll = dialog
+                        .suggestions
+                        .len()
+                        .saturating_sub(PATH_SUGGESTION_PAGE_SIZE);
+                    dialog.suggestion_scroll =
+                        dialog.suggestion_scroll.saturating_add(3).min(max_scroll);
+                }
+                _ => {}
+            }
+            return;
+        }
         if self.handle_scrollbar_mouse(mouse) {
             return;
         }
@@ -2335,6 +2562,7 @@ impl App {
                     self.focus = Focus::Viewer;
                     self.mouse_dragging = true;
                     self.edit_high_nibble = true;
+                    self.insert_at_end = false;
                 } else if !self.edit_mode
                     && let Some(index) = self.field_at(mouse.column, mouse.row)
                 {
@@ -2503,6 +2731,7 @@ impl App {
             self.selection = Some(Selection::new(offset));
             self.additional_selections.clear();
         }
+        self.insert_at_end = false;
         self.ensure_visible(offset);
     }
 
@@ -2519,16 +2748,40 @@ impl App {
         }
     }
 
+    fn toggle_edit_kind(&mut self) {
+        self.commit_pending_edit();
+        self.edit_kind = self.edit_kind.toggle();
+        self.edit_high_nibble = true;
+        self.insert_at_end = false;
+        self.status = match self.edit_kind {
+            EditKind::Overwrite => "Overwrite Mode: type two hex digits per byte".into(),
+            EditKind::Insert => {
+                "Insert Mode: type two hex digits to insert; Backspace/Delete removes selection"
+                    .into()
+            }
+        };
+    }
+
+    fn edit_nibble(&mut self, nibble: u8) {
+        match self.edit_kind {
+            EditKind::Overwrite => self.overwrite_nibble(nibble),
+            EditKind::Insert => self.insert_nibble(nibble),
+        }
+    }
+
     fn overwrite_nibble(&mut self, nibble: u8) {
         let Some(offset) = self.selection.map(|selection| selection.cursor) else {
             return;
         };
+        if offset >= self.bytes.len() {
+            return;
+        }
         self.cancel_search();
         self.search.results.clear();
         let bytes = Arc::make_mut(&mut self.bytes);
         let original = bytes[offset];
         if self.edit_high_nibble {
-            self.pending_edit = Some(PendingEdit {
+            self.pending_edit = Some(PendingEdit::Overwrite {
                 offset,
                 before: original,
             });
@@ -2540,12 +2793,11 @@ impl App {
         };
         self.invalidate_entropy();
         self.rebuild_display_rows();
-        self.update_dirty_offset(offset);
+        self.refresh_modified_offsets();
         if self.edit_high_nibble {
             self.edit_high_nibble = false;
         } else {
             self.commit_pending_edit();
-            self.edit_high_nibble = true;
             let next = (offset + 1).min(self.bytes.len() - 1);
             self.selection = Some(Selection::new(next));
             self.additional_selections.clear();
@@ -2554,18 +2806,167 @@ impl App {
         self.status = format!("Modified byte at 0x{offset:X}; Ctrl+S saves");
     }
 
+    fn insert_nibble(&mut self, nibble: u8) {
+        let offset = if self.insert_at_end {
+            self.bytes.len()
+        } else {
+            self.selection
+                .map(|selection| selection.cursor)
+                .unwrap_or(self.bytes.len())
+        };
+        if self.edit_high_nibble {
+            self.pending_edit = Some(PendingEdit::Insert {
+                offset,
+                high_nibble: nibble,
+            });
+            self.edit_high_nibble = false;
+            self.status = format!("Insert at 0x{offset:X}: enter the second hex digit");
+            return;
+        }
+        let Some(PendingEdit::Insert {
+            offset,
+            high_nibble,
+        }) = self.pending_edit.take()
+        else {
+            self.edit_high_nibble = true;
+            return;
+        };
+        let byte = (high_nibble << 4) | nibble;
+        self.insert_bytes_at(offset, &[byte]);
+        self.undo_stack.push(EditAction::Insert { offset, byte });
+        self.redo_stack.clear();
+        self.edit_high_nibble = true;
+        self.additional_selections.clear();
+        let next = (offset + 1).min(self.bytes.len().saturating_sub(1));
+        self.selection = Some(Selection::new(next));
+        self.insert_at_end = offset + 1 == self.bytes.len();
+        self.ensure_visible(next);
+        self.status = format!("Inserted {byte:02X} at 0x{offset:X}; Ctrl+S saves");
+    }
+
+    fn delete_selected_bytes(&mut self) {
+        self.commit_pending_edit();
+        let Some(selection) = self.selection else {
+            self.status = "No bytes selected to delete".into();
+            return;
+        };
+        if self.bytes.is_empty() {
+            self.status = "No bytes selected to delete".into();
+            return;
+        }
+        let start = selection.start().min(self.bytes.len() - 1);
+        let end = selection.end().min(self.bytes.len() - 1);
+        let removed = self.delete_bytes_at(start, end - start + 1);
+        if removed.is_empty() {
+            self.status = "No bytes selected to delete".into();
+            return;
+        }
+        self.undo_stack.push(EditAction::Delete {
+            offset: start,
+            bytes: removed.clone(),
+        });
+        self.redo_stack.clear();
+        self.additional_selections.clear();
+        self.insert_at_end = false;
+        if self.bytes.is_empty() {
+            self.selection = None;
+        } else {
+            let next = start.min(self.bytes.len() - 1);
+            self.selection = Some(Selection::new(next));
+            self.ensure_visible(next);
+        }
+        self.status = format!("Deleted {} byte(s); Ctrl+S saves", removed.len());
+    }
+
+    fn insert_bytes_at(&mut self, offset: usize, bytes_to_insert: &[u8]) {
+        if bytes_to_insert.is_empty() {
+            return;
+        }
+        let offset = offset.min(self.bytes.len());
+        self.cancel_search();
+        self.search.results.clear();
+        Arc::make_mut(&mut self.bytes).splice(offset..offset, bytes_to_insert.iter().copied());
+        self.shift_fields_for_insert(offset, bytes_to_insert.len());
+        self.invalidate_entropy();
+        self.rebuild_display_rows();
+        self.refresh_modified_offsets();
+    }
+
+    fn delete_bytes_at(&mut self, offset: usize, length: usize) -> Vec<u8> {
+        if length == 0 || offset >= self.bytes.len() {
+            return Vec::new();
+        }
+        let end = offset.saturating_add(length).min(self.bytes.len());
+        self.cancel_search();
+        self.search.results.clear();
+        let removed = Arc::make_mut(&mut self.bytes)
+            .drain(offset..end)
+            .collect::<Vec<_>>();
+        self.shift_fields_for_delete(offset, removed.len());
+        self.invalidate_entropy();
+        self.rebuild_display_rows();
+        self.refresh_modified_offsets();
+        removed
+    }
+
+    fn shift_fields_for_insert(&mut self, offset: usize, length: usize) {
+        for field in &mut self.fields {
+            if field.start >= offset {
+                field.start = field.start.saturating_add(length);
+                field.end = field.end.saturating_add(length);
+            } else if field.end >= offset {
+                field.end = field.end.saturating_add(length);
+            }
+        }
+    }
+
+    fn shift_fields_for_delete(&mut self, offset: usize, length: usize) {
+        if length == 0 {
+            return;
+        }
+        let end = offset.saturating_add(length - 1);
+        self.fields.retain_mut(|field| {
+            if field.end < offset {
+                return true;
+            }
+            if field.start > end {
+                field.start = field.start.saturating_sub(length);
+                field.end = field.end.saturating_sub(length);
+                return true;
+            }
+            if field.start < offset {
+                if field.end > end {
+                    field.end = field.end.saturating_sub(length);
+                } else {
+                    field.end = offset.saturating_sub(1);
+                }
+                return field.start <= field.end;
+            }
+            if field.end > end {
+                field.start = offset;
+                field.end = field.end.saturating_sub(length);
+                return true;
+            }
+            false
+        });
+        self.selected_field = self.selected_field.min(self.fields.len().saturating_sub(1));
+        self.fields_scroll = self.fields_scroll.min(self.field_max_scroll());
+    }
+
     fn commit_pending_edit(&mut self) {
         let Some(pending) = self.pending_edit.take() else {
             return;
         };
-        let after = self.bytes[pending.offset];
-        if pending.before != after {
-            self.undo_stack.push(EditAction {
-                offset: pending.offset,
-                before: pending.before,
-                after,
-            });
-            self.redo_stack.clear();
+        if let PendingEdit::Overwrite { offset, before } = pending {
+            let after = self.bytes[offset];
+            if before != after {
+                self.undo_stack.push(EditAction::Overwrite {
+                    offset,
+                    before,
+                    after,
+                });
+                self.redo_stack.clear();
+            }
         }
         self.edit_high_nibble = true;
     }
@@ -2576,17 +2977,36 @@ impl App {
             self.status = "Nothing to undo".into();
             return;
         };
-        self.cancel_search();
-        self.search.results.clear();
-        Arc::make_mut(&mut self.bytes)[action.offset] = action.before;
-        self.invalidate_entropy();
-        self.rebuild_display_rows();
-        self.update_dirty_offset(action.offset);
+        let (offset, description) = match &action {
+            EditAction::Overwrite { offset, before, .. } => {
+                self.cancel_search();
+                self.search.results.clear();
+                Arc::make_mut(&mut self.bytes)[*offset] = *before;
+                self.invalidate_entropy();
+                self.rebuild_display_rows();
+                self.refresh_modified_offsets();
+                (*offset, "overwrite")
+            }
+            EditAction::Insert { offset, .. } => {
+                self.delete_bytes_at(*offset, 1);
+                (*offset, "insertion")
+            }
+            EditAction::Delete { offset, bytes } => {
+                self.insert_bytes_at(*offset, bytes);
+                (*offset, "deletion")
+            }
+        };
         self.redo_stack.push(action);
-        self.selection = Some(Selection::new(action.offset));
         self.additional_selections.clear();
-        self.ensure_visible(action.offset);
-        self.status = format!("Undid overwrite at 0x{:X}", action.offset);
+        self.insert_at_end = false;
+        if self.bytes.is_empty() {
+            self.selection = None;
+        } else {
+            let selection = offset.min(self.bytes.len() - 1);
+            self.selection = Some(Selection::new(selection));
+            self.ensure_visible(selection);
+        }
+        self.status = format!("Undid {description} at 0x{offset:X}");
     }
 
     fn redo_overwrite(&mut self) {
@@ -2595,25 +3015,42 @@ impl App {
             self.status = "Nothing to redo".into();
             return;
         };
-        self.cancel_search();
-        self.search.results.clear();
-        Arc::make_mut(&mut self.bytes)[action.offset] = action.after;
-        self.invalidate_entropy();
-        self.rebuild_display_rows();
-        self.update_dirty_offset(action.offset);
+        let (offset, description) = match &action {
+            EditAction::Overwrite { offset, after, .. } => {
+                self.cancel_search();
+                self.search.results.clear();
+                Arc::make_mut(&mut self.bytes)[*offset] = *after;
+                self.invalidate_entropy();
+                self.rebuild_display_rows();
+                self.refresh_modified_offsets();
+                (*offset, "overwrite")
+            }
+            EditAction::Insert { offset, byte } => {
+                self.insert_bytes_at(*offset, &[*byte]);
+                (*offset, "insertion")
+            }
+            EditAction::Delete { offset, bytes } => {
+                self.delete_bytes_at(*offset, bytes.len());
+                (*offset, "deletion")
+            }
+        };
         self.undo_stack.push(action);
-        self.selection = Some(Selection::new(action.offset));
         self.additional_selections.clear();
-        self.ensure_visible(action.offset);
-        self.status = format!("Redid overwrite at 0x{:X}", action.offset);
+        self.insert_at_end = false;
+        if self.bytes.is_empty() {
+            self.selection = None;
+        } else {
+            let selection = offset.min(self.bytes.len() - 1);
+            self.selection = Some(Selection::new(selection));
+            self.ensure_visible(selection);
+        }
+        self.status = format!("Redid {description} at 0x{offset:X}");
     }
 
-    fn update_dirty_offset(&mut self, offset: usize) {
-        if self.bytes[offset] == self.saved_bytes[offset] {
-            self.modified_offsets.remove(&offset);
-        } else {
-            self.modified_offsets.insert(offset);
-        }
+    fn refresh_modified_offsets(&mut self) {
+        self.modified_offsets = (0..self.bytes.len().max(self.saved_bytes.len()))
+            .filter(|offset| self.bytes.get(*offset) != self.saved_bytes.get(*offset))
+            .collect();
     }
 
     fn toggle_setting(&mut self, active: usize) {
@@ -2642,13 +3079,6 @@ impl App {
             }
             6 => self.settings.show_overlays = !self.settings.show_overlays,
             _ => {}
-        }
-    }
-
-    pub fn set_bytes_per_row(&mut self, bytes_per_row: usize) {
-        if self.settings.bytes_per_row != bytes_per_row {
-            self.settings.bytes_per_row = bytes_per_row;
-            self.rebuild_display_rows();
         }
     }
 
@@ -2788,6 +3218,7 @@ impl App {
         }
         self.mode = Mode::Normal;
         self.activate_selected_field();
+        self.save_automatic_overlay_after_change();
     }
 
     fn delete_selected_field(&mut self) {
@@ -2798,6 +3229,7 @@ impl App {
         self.selected_field = self.selected_field.min(self.fields.len().saturating_sub(1));
         self.ensure_selected_field_visible();
         self.status = format!("Deleted field '{}'", removed.name);
+        self.save_automatic_overlay_after_change();
     }
 
     fn select_previous_field(&mut self) {
@@ -2976,9 +3408,7 @@ impl App {
 
     fn open_path_dialog(&mut self, action: PathAction) {
         let suggested = match action {
-            PathAction::SaveOverlay | PathAction::LoadOverlay => {
-                suggested_path(&self.path, "rexedit-overlay.json")
-            }
+            PathAction::SaveOverlay | PathAction::LoadOverlay => self.automatic_overlay_path(),
             PathAction::SaveBinary => self.path.clone(),
             PathAction::SaveTheme | PathAction::LoadTheme => suggested_named_path(&format!(
                 "{}.rexedit-theme.json",
@@ -2988,6 +3418,9 @@ impl App {
         self.mode = Mode::Path(PathDialog {
             action,
             input: TextInput::with_value(suggested.display().to_string()),
+            suggestions: Vec::new(),
+            active_suggestion: None,
+            suggestion_scroll: 0,
         });
     }
 
@@ -3013,6 +3446,15 @@ impl App {
     }
 
     fn save_overlay_to(&self, path: &Path) -> Result<String, String> {
+        let automatic_dir = overlay_storage_dir();
+        if path.starts_with(&automatic_dir) {
+            fs::create_dir_all(&automatic_dir).map_err(|error| {
+                format!(
+                    "Could not create overlay storage directory {}: {error}",
+                    automatic_dir.display()
+                )
+            })?;
+        }
         let json = serde_json::to_string_pretty(&Overlay {
             fields: self.fields.clone(),
         })
@@ -3049,7 +3491,15 @@ impl App {
         self.undo_stack.clear();
         self.redo_stack.clear();
         self.quit_armed = false;
-        Ok(format!("Saved binary to {}", path.display()))
+        match self.persist_automatic_overlay() {
+            Ok(Some(overlay)) => Ok(format!(
+                "Saved binary to {}; overlay saved to {}",
+                path.display(),
+                overlay.display()
+            )),
+            Ok(None) => Ok(format!("Saved binary to {}", path.display())),
+            Err(error) => Ok(format!("Saved binary to {}; {error}", path.display())),
+        }
     }
 
     fn save_theme_to(&self, path: &Path) -> Result<String, String> {
@@ -3096,12 +3546,50 @@ impl App {
     }
 }
 
-fn suggested_path(binary: &Path, suffix: &str) -> PathBuf {
-    let file_name = binary
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("binary");
-    suggested_named_path(&format!("{file_name}.{suffix}"))
+fn overlay_storage_dir() -> PathBuf {
+    #[cfg(windows)]
+    if let Some(directory) = env::var_os("APPDATA") {
+        return PathBuf::from(directory).join("rexedit").join("overlays");
+    }
+
+    #[cfg(target_os = "macos")]
+    if let Some(home) = user_home_dir() {
+        return home
+            .join("Library")
+            .join("Application Support")
+            .join("rexedit")
+            .join("overlays");
+    }
+
+    if let Some(directory) = env::var_os("XDG_DATA_HOME") {
+        return PathBuf::from(directory).join("rexedit").join("overlays");
+    }
+    user_home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".local")
+        .join("share")
+        .join("rexedit")
+        .join("overlays")
+}
+
+fn user_home_dir() -> Option<PathBuf> {
+    env::var_os("HOME")
+        .or_else(|| env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+}
+
+fn content_identity(bytes: &[u8]) -> String {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut first = FNV_OFFSET;
+    let mut second = FNV_OFFSET ^ 0x9e37_79b9_7f4a_7c15;
+    for byte in bytes {
+        first ^= u64::from(*byte);
+        first = first.wrapping_mul(FNV_PRIME);
+        second ^= u64::from(*byte).wrapping_add(0x9d);
+        second = second.wrapping_mul(FNV_PRIME);
+    }
+    format!("{:016x}{:016x}{:016x}", bytes.len(), first, second)
 }
 
 fn suggested_named_path(file_name: &str) -> PathBuf {
@@ -3325,7 +3813,7 @@ fn copy_to_clipboard(content: &str) -> Result<(), String> {
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::null());
         match write_clipboard_command(&mut command, content) {
             Ok(()) => return Ok(()),
             Err(error) => errors.push(format!("{program}: {error}")),
@@ -3347,25 +3835,35 @@ fn write_clipboard_command(command: &mut Command, content: &str) -> Result<(), S
     let mut child = command
         .spawn()
         .map_err(|error| format!("could not start: {error}"))?;
-    let stdin = child
+    let mut stdin = child
         .stdin
-        .as_mut()
+        .take()
         .ok_or_else(|| "did not accept input".to_string())?;
     stdin
         .write_all(content.as_bytes())
         .map_err(|error| format!("could not write data: {error}"))?;
-    let output = child
-        .wait_with_output()
-        .map_err(|error| format!("could not wait for completion: {error}"))?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        let error = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        Err(if error.is_empty() {
-            "did not complete successfully".into()
-        } else {
-            error
-        })
+    drop(stdin);
+
+    // X11 clipboard owners such as xclip intentionally stay alive until another
+    // application takes ownership. Waiting for them here blocks the event loop
+    // forever after Ctrl+C. Give a command a short window to report an immediate
+    // failure, then let a small reaper thread wait for long-lived owners.
+    let deadline = Instant::now() + Duration::from_millis(150);
+    loop {
+        match child
+            .try_wait()
+            .map_err(|error| format!("could not check clipboard command: {error}"))?
+        {
+            Some(status) if status.success() => return Ok(()),
+            Some(_) => return Err("did not complete successfully".into()),
+            None if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            None => {
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+                return Ok(());
+            }
+        }
     }
 }
 
@@ -3686,9 +4184,19 @@ mod tests {
     }
 
     #[test]
-    fn suggested_overlay_path_uses_the_working_directory() {
-        let path = suggested_path(Path::new("C:/protected/sample.bin"), "rexedit-overlay.json");
-        assert_eq!(path.file_name().unwrap(), "sample.bin.rexedit-overlay.json");
+    fn automatic_overlay_path_uses_the_user_data_directory_and_content_identity() {
+        let app = App::new("sample.bin".into(), vec![0xCA, 0xFE]);
+        assert_eq!(
+            app.automatic_overlay_path().parent(),
+            Some(overlay_storage_dir().as_path())
+        );
+        assert_eq!(
+            app.automatic_overlay_path()
+                .file_name()
+                .unwrap()
+                .to_string_lossy(),
+            format!("{}.json", content_identity(&[0xCA, 0xFE]))
+        );
     }
 
     #[test]
@@ -3714,6 +4222,83 @@ mod tests {
         app.redo_overwrite();
         assert_eq!(app.bytes[0], 0x12);
         assert!(app.modified_offsets.contains(&0));
+    }
+
+    #[test]
+    fn insert_mode_inserts_bytes_and_undo_redo_restore_file_length() {
+        let mut app = App::new("sample.bin".into(), vec![0xAA, 0xBB]);
+        app.edit_kind = EditKind::Insert;
+        app.insert_nibble(0x1);
+        app.insert_nibble(0x2);
+
+        assert_eq!(app.bytes.as_slice(), [0x12, 0xAA, 0xBB]);
+        assert!(app.modified_offsets.contains(&2));
+
+        app.undo_overwrite();
+        assert_eq!(app.bytes.as_slice(), [0xAA, 0xBB]);
+
+        app.redo_overwrite();
+        assert_eq!(app.bytes.as_slice(), [0x12, 0xAA, 0xBB]);
+    }
+
+    #[test]
+    fn deletion_updates_file_length_and_field_offsets() {
+        let mut app = App::new("sample.bin".into(), vec![0, 1, 2, 3, 4]);
+        app.fields = vec![
+            Field {
+                name: "before".into(),
+                description: String::new(),
+                start: 0,
+                end: 0,
+                color: FieldColor::Cyan,
+            },
+            Field {
+                name: "after".into(),
+                description: String::new(),
+                start: 3,
+                end: 4,
+                color: FieldColor::Cyan,
+            },
+        ];
+        app.selection = Some(Selection {
+            anchor: 1,
+            cursor: 2,
+        });
+        app.delete_selected_bytes();
+
+        assert_eq!(app.bytes.as_slice(), [0, 3, 4]);
+        assert_eq!((app.fields[1].start, app.fields[1].end), (1, 2));
+
+        app.undo_overwrite();
+        assert_eq!(app.bytes.as_slice(), [0, 1, 2, 3, 4]);
+        assert_eq!((app.fields[1].start, app.fields[1].end), (3, 4));
+    }
+
+    #[test]
+    fn save_dialog_supports_directory_completion() {
+        let directory = temporary_file("save-completion");
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("output.bin"), []).unwrap();
+        fs::write(directory.join("outline.bin"), []).unwrap();
+        let mut app = App::new("sample.bin".into(), vec![0]);
+        app.open_path_dialog(PathAction::SaveBinary);
+        let Mode::Path(dialog) = &mut app.mode else {
+            panic!("save path dialog should be open");
+        };
+        dialog.input.set_value(format!(
+            "{}{}out",
+            directory.display(),
+            std::path::MAIN_SEPARATOR
+        ));
+        app.handle_path_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+
+        let Mode::Path(dialog) = &app.mode else {
+            panic!("save path dialog should stay open");
+        };
+        assert_eq!(dialog.suggestions.len(), 2);
+        assert!(dialog.suggestions.contains(&directory.join("output.bin")));
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
