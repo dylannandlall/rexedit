@@ -9,7 +9,7 @@ use std::{env, fs, io::stdout, path::PathBuf};
 
 use app::{App, Workspace};
 use crossterm::{
-    event::{DisableMouseCapture, EnableMouseCapture},
+    event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture},
     execute,
 };
 
@@ -35,9 +35,9 @@ fn main() -> color_eyre::Result<()> {
     let mut workspace = Workspace::new(documents);
 
     let mut terminal = ratatui::init();
-    execute!(stdout(), EnableMouseCapture)?;
+    execute!(stdout(), EnableMouseCapture, EnableBracketedPaste)?;
     let result = workspace.run(&mut terminal);
-    execute!(stdout(), DisableMouseCapture)?;
+    execute!(stdout(), DisableBracketedPaste, DisableMouseCapture)?;
     ratatui::restore();
 
     result?;
@@ -66,7 +66,7 @@ View Mode:
   Ctrl+F            search bytes asynchronously
   n / N             next / previous search match
   Ctrl+G            jump to an offset
-  Ctrl+C            copy the selection as continuous hexadecimal
+  Ctrl+C / Ctrl+Shift+C (Cmd+C on macOS)   copy the selection as continuous hexadecimal
   gg / G            jump to the start / end of the file
   Ctrl+U / Ctrl+R   undo / redo byte edits
   Ctrl+S            save the edited binary
@@ -77,8 +77,10 @@ View Mode:
 
 Byte Edit Mode:
   hexadecimal keys  edit a byte using two hexadecimal digits
-  Insert            switch between Overwrite and Insert Mode
+  Insert / i        switch between Overwrite and Insert Mode
   Backspace/Delete  delete the selected byte range
+  Ctrl+C / Ctrl+Shift+C (Cmd+C on macOS)   copy the selection as continuous hexadecimal
+  Ctrl+V / Ctrl+Shift+V (Cmd+V on macOS)   paste hexadecimal from the clipboard
   Ctrl+U / Ctrl+R   undo / redo overwrite, insertion, or deletion
   Ctrl+S            save the edited binary
   Escape            return to View Mode

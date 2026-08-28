@@ -687,7 +687,7 @@ fn render_fields(frame: &mut Frame, app: &App, area: Rect) {
         Paragraph::new(lines).block(
             Block::default()
                 .title(Span::styled(
-                    " Fields [wheel scroll, a add, Enter edit, d delete] ",
+                    " Fields [wheel scroll, a add, Enter edit, d/Del delete] ",
                     title_style(app, active),
                 ))
                 .borders(Borders::ALL)
@@ -939,7 +939,7 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
     ]);
     let second = Line::styled(&app.status, Style::default().fg(Color::Cyan));
     let help = if app.edit_mode {
-        "Ctrl+B then Left/Right binary | Insert switches overwrite/insert | Del removes selection | Ctrl+U/R undo/redo | Ctrl+S save | Esc View Mode | ? keybinds"
+        "Ctrl+B then Left/Right binary | Insert/i switches overwrite/insert | Del removes selection | Ctrl+U/R undo/redo | Ctrl+S save | Esc View Mode | ? keybinds"
     } else {
         "Ctrl+B then Left/Right binary, S compare | Ctrl+U/R undo/redo | Ctrl+S save | Ctrl+F search | i edit | ? keybinds"
     };
@@ -1624,7 +1624,7 @@ fn keybinding_lines() -> Vec<Line<'static>> {
         binding("Ctrl+Down / Ctrl+Up", "next / previous search result"),
         binding("Ctrl+G", "jump to a decimal or hexadecimal offset"),
         binding(
-            "Ctrl+C / Ctrl+Shift+C",
+            "Ctrl+C / Ctrl+Shift+C (Cmd+C on macOS)",
             "copy every selected range as continuous hexadecimal",
         ),
         binding("Ctrl+U / Ctrl+R", "undo / redo byte edits"),
@@ -1632,7 +1632,7 @@ fn keybinding_lines() -> Vec<Line<'static>> {
         binding("a", "create a field from the current selection"),
         binding("Tab", "switch between viewer and fields pane"),
         binding("Enter", "edit the selected field"),
-        binding("d", "delete the selected field"),
+        binding("d / Delete", "delete the selected field"),
         binding("[ / ]", "select previous / next field"),
         binding(
             "Ctrl+O / Ctrl+L",
@@ -1645,7 +1645,7 @@ fn keybinding_lines() -> Vec<Line<'static>> {
         Line::from(""),
         section("Byte Edit Mode"),
         binding("0-9, A-F", "overwrite the selected byte, two nibbles"),
-        binding("Insert", "toggle between Overwrite and Insert Mode"),
+        binding("Insert / i", "toggle between Overwrite and Insert Mode"),
         binding(
             "0-9, A-F in Insert",
             "insert a byte at the cursor, two nibbles",
@@ -1653,6 +1653,14 @@ fn keybinding_lines() -> Vec<Line<'static>> {
         binding(
             "Backspace / Delete",
             "delete the current selected byte range",
+        ),
+        binding(
+            "Ctrl+C / Ctrl+Shift+C (Cmd+C on macOS)",
+            "copy every selected range as continuous hexadecimal",
+        ),
+        binding(
+            "Ctrl+V / Ctrl+Shift+V (Cmd+V on macOS)",
+            "paste hexadecimal from the clipboard as one batched edit",
         ),
         binding(
             "arrows / Page Up/Down",

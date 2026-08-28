@@ -408,9 +408,18 @@ enum EditAction {
         before: u8,
         after: u8,
     },
+    OverwriteMany {
+        offset: usize,
+        before: Vec<u8>,
+        after: Vec<u8>,
+    },
     Insert {
         offset: usize,
         byte: u8,
+    },
+    InsertMany {
+        offset: usize,
+        bytes: Vec<u8>,
     },
     Delete {
         offset: usize,
@@ -712,9 +721,46 @@ impl Workspace {
                     }
                 }
                 Event::Mouse(mouse) => self.handle_workspace_mouse(mouse),
+                Event::Paste(text) if self.handle_workspace_paste(&text)? => {
+                    self.persist_all_automatic_overlays();
+                    for document in &mut self.documents {
+                        document.cancel_search();
+                    }
+                    return Ok(());
+                }
                 _ => {}
             }
         }
+    }
+
+    /// Bracketed paste delivers the whole clipboard as one event. In Byte Edit
+    /// Mode we decode it and apply it as a single batched edit rather than
+    /// simulating a keystroke per character, since that path is quadratic for
+    /// large pastes. Everywhere else (search boxes, field names, path
+    /// dialogs, …) we fall back to feeding each character through the normal
+    /// key dispatch, which is the same effective behavior a terminal without
+    /// bracketed paste support already produces for those small inputs.
+    fn handle_workspace_paste(&mut self, text: &str) -> io::Result<bool> {
+        if !self.documents.is_empty() && self.open_file_dialog.is_none() {
+            let active = self.active();
+            let byte_edit_active = active.edit_mode
+                && active.focus == Focus::Viewer
+                && matches!(active.mode, Mode::Normal | Mode::Python(_));
+            if byte_edit_active {
+                self.active_mut().paste_hex_bytes(text);
+                return Ok(false);
+            }
+        }
+        for character in text.chars() {
+            if character == '\n' || character == '\r' {
+                continue;
+            }
+            let key = KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE);
+            if self.handle_workspace_key(key)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn handle_workspace_key(&mut self, key: KeyEvent) -> io::Result<bool> {
@@ -1497,11 +1543,26 @@ impl App {
                 KeyCode::Char('r') => self.redo_overwrite(),
                 KeyCode::Char('s') => self.open_path_dialog(PathAction::SaveBinary),
                 KeyCode::Char('c' | 'C') => self.copy_selection_as_hex(),
+                KeyCode::Char('v' | 'V') => self.paste_from_clipboard(),
                 KeyCode::Up => self.previous_search_result(),
                 KeyCode::Down => self.next_search_result(),
                 _ => {}
             }
             return Ok(false);
+        }
+        #[cfg(target_os = "macos")]
+        if key.modifiers.contains(KeyModifiers::SUPER) {
+            match key.code {
+                KeyCode::Char('c' | 'C') => {
+                    self.copy_selection_as_hex();
+                    return Ok(false);
+                }
+                KeyCode::Char('v' | 'V') => {
+                    self.paste_from_clipboard();
+                    return Ok(false);
+                }
+                _ => {}
+            }
         }
 
         match key.code {
@@ -1550,7 +1611,9 @@ impl App {
                 self.select_offset(self.bytes.len() - 1, false);
             }
             KeyCode::Enter if self.focus == Focus::Fields => self.edit_selected_field(),
-            KeyCode::Char('d') if self.focus == Focus::Fields => self.delete_selected_field(),
+            KeyCode::Char('d') | KeyCode::Delete if self.focus == Focus::Fields => {
+                self.delete_selected_field()
+            }
             KeyCode::Up if self.focus == Focus::Fields => self.select_previous_field(),
             KeyCode::Down if self.focus == Focus::Fields => self.select_next_field(),
             KeyCode::Char('[') => self.select_previous_field(),
@@ -1601,9 +1664,24 @@ impl App {
                     self.open_path_dialog(PathAction::SaveBinary);
                 }
                 KeyCode::Char('c' | 'C') => self.copy_selection_as_hex(),
+                KeyCode::Char('v' | 'V') => self.paste_from_clipboard(),
                 _ => {}
             }
             return Ok(false);
+        }
+        #[cfg(target_os = "macos")]
+        if key.modifiers.contains(KeyModifiers::SUPER) {
+            match key.code {
+                KeyCode::Char('c' | 'C') => {
+                    self.copy_selection_as_hex();
+                    return Ok(false);
+                }
+                KeyCode::Char('v' | 'V') => {
+                    self.paste_from_clipboard();
+                    return Ok(false);
+                }
+                _ => {}
+            }
         }
 
         match key.code {
@@ -1624,7 +1702,7 @@ impl App {
                     return Ok(true);
                 }
             }
-            KeyCode::Insert => self.toggle_edit_kind(),
+            KeyCode::Insert | KeyCode::Char('i') => self.toggle_edit_kind(),
             KeyCode::Backspace | KeyCode::Delete => self.delete_selected_bytes(),
             KeyCode::Char(character) if character.is_ascii_hexdigit() => {
                 let nibble = character.to_digit(16).expect("checked hex digit") as u8;
@@ -2259,6 +2337,7 @@ impl App {
             }
             (Focus::Fields, KeyCode::Up | KeyCode::Char('[')) => self.select_previous_field(),
             (Focus::Fields, KeyCode::Down | KeyCode::Char(']')) => self.select_next_field(),
+            (Focus::Fields, KeyCode::Char('d') | KeyCode::Delete) => self.delete_selected_field(),
             _ => {}
         }
     }
@@ -2276,7 +2355,7 @@ impl App {
             return;
         }
         match key.code {
-            KeyCode::Insert => self.toggle_edit_kind(),
+            KeyCode::Insert | KeyCode::Char('i') => self.toggle_edit_kind(),
             KeyCode::Backspace | KeyCode::Delete => self.delete_selected_bytes(),
             KeyCode::Char(character) if character.is_ascii_hexdigit() => {
                 self.edit_nibble(character.to_digit(16).expect("hex digit") as u8)
@@ -2748,6 +2827,22 @@ impl App {
         }
     }
 
+    /// Reads hex directly from the system clipboard and applies it through the
+    /// same batched path as a bracketed paste. Terminal-relayed paste is
+    /// unreliable on some platforms (notably Windows, where bracketed paste
+    /// support in crossterm falls back to a flood of individual keystrokes),
+    /// so this keybind is the dependable route to a fast paste everywhere.
+    fn paste_from_clipboard(&mut self) {
+        if !self.edit_mode {
+            self.status = "Enter Overwrite or Insert Mode (i) before pasting bytes".into();
+            return;
+        }
+        match read_clipboard() {
+            Ok(text) => self.paste_hex_bytes(&text),
+            Err(error) => self.status = format!("Could not paste from clipboard: {error}"),
+        }
+    }
+
     fn toggle_edit_kind(&mut self) {
         self.commit_pending_edit();
         self.edit_kind = self.edit_kind.toggle();
@@ -2878,6 +2973,107 @@ impl App {
         self.status = format!("Deleted {} byte(s); Ctrl+S saves", removed.len());
     }
 
+    /// Decodes pasted hexadecimal text and applies it in a single batched
+    /// edit, instead of routing every nibble through the normal one-byte-at-a-time
+    /// key handling. A per-character path re-shifts and re-scans the whole
+    /// buffer once per byte, which is quadratic for large pastes.
+    fn paste_hex_bytes(&mut self, text: &str) {
+        self.commit_pending_edit();
+        let mut bytes = Vec::new();
+        let mut pending_high_nibble = None;
+        for character in text.chars() {
+            if !character.is_ascii_hexdigit() {
+                continue;
+            }
+            let nibble = character.to_digit(16).expect("checked hex digit") as u8;
+            match pending_high_nibble.take() {
+                Some(high) => bytes.push((high << 4) | nibble),
+                None => pending_high_nibble = Some(nibble),
+            }
+        }
+        if bytes.is_empty() {
+            self.status = "Clipboard did not contain a full byte of hex digits".into();
+            return;
+        }
+        match self.edit_kind {
+            EditKind::Insert => self.paste_insert_bytes(&bytes),
+            EditKind::Overwrite => self.paste_overwrite_bytes(&bytes),
+        }
+        if pending_high_nibble.is_some() {
+            self.status = format!("{} (trailing hex digit ignored)", self.status);
+        }
+    }
+
+    fn paste_insert_bytes(&mut self, bytes: &[u8]) {
+        let offset = if self.insert_at_end {
+            self.bytes.len()
+        } else {
+            self.selection
+                .map(|selection| selection.cursor)
+                .unwrap_or(self.bytes.len())
+        };
+        self.insert_bytes_at(offset, bytes);
+        self.undo_stack.push(EditAction::InsertMany {
+            offset,
+            bytes: bytes.to_vec(),
+        });
+        self.redo_stack.clear();
+        self.edit_high_nibble = true;
+        self.additional_selections.clear();
+        let next = (offset + bytes.len()).min(self.bytes.len().saturating_sub(1));
+        self.selection = Some(Selection::new(next));
+        self.insert_at_end = offset + bytes.len() == self.bytes.len();
+        self.ensure_visible(next);
+        self.status = format!(
+            "Inserted {} byte(s) at 0x{offset:X}; Ctrl+S saves",
+            bytes.len()
+        );
+    }
+
+    fn paste_overwrite_bytes(&mut self, bytes: &[u8]) {
+        let Some(offset) = self.selection.map(|selection| selection.cursor) else {
+            self.status = "No bytes selected to overwrite".into();
+            return;
+        };
+        if offset >= self.bytes.len() {
+            self.status = "No bytes selected to overwrite".into();
+            return;
+        }
+        self.cancel_search();
+        self.search.results.clear();
+        let available = self.bytes.len() - offset;
+        let truncated = bytes.len() > available;
+        let bytes = &bytes[..bytes.len().min(available)];
+        let buffer = Arc::make_mut(&mut self.bytes);
+        let before = buffer[offset..offset + bytes.len()].to_vec();
+        buffer[offset..offset + bytes.len()].copy_from_slice(bytes);
+        self.invalidate_entropy();
+        self.rebuild_display_rows();
+        self.refresh_modified_offsets();
+        self.undo_stack.push(EditAction::OverwriteMany {
+            offset,
+            before,
+            after: bytes.to_vec(),
+        });
+        self.redo_stack.clear();
+        self.edit_high_nibble = true;
+        self.additional_selections.clear();
+        let next = (offset + bytes.len()).min(self.bytes.len() - 1);
+        self.selection = Some(Selection::new(next));
+        self.ensure_visible(next);
+        self.status = if truncated {
+            format!(
+                "Overwrote {} byte(s) at 0x{offset:X} (truncated at end of file); Ctrl+S saves",
+                bytes.len()
+            )
+        } else {
+            format!(
+                "Overwrote {} byte(s) at 0x{offset:X}; Ctrl+S saves",
+                bytes.len()
+            )
+        };
+    }
+
     fn insert_bytes_at(&mut self, offset: usize, bytes_to_insert: &[u8]) {
         if bytes_to_insert.is_empty() {
             return;
@@ -2987,8 +3183,22 @@ impl App {
                 self.refresh_modified_offsets();
                 (*offset, "overwrite")
             }
+            EditAction::OverwriteMany { offset, before, .. } => {
+                self.cancel_search();
+                self.search.results.clear();
+                Arc::make_mut(&mut self.bytes)[*offset..*offset + before.len()]
+                    .copy_from_slice(before);
+                self.invalidate_entropy();
+                self.rebuild_display_rows();
+                self.refresh_modified_offsets();
+                (*offset, "overwrite")
+            }
             EditAction::Insert { offset, .. } => {
                 self.delete_bytes_at(*offset, 1);
+                (*offset, "insertion")
+            }
+            EditAction::InsertMany { offset, bytes } => {
+                self.delete_bytes_at(*offset, bytes.len());
                 (*offset, "insertion")
             }
             EditAction::Delete { offset, bytes } => {
@@ -3025,8 +3235,22 @@ impl App {
                 self.refresh_modified_offsets();
                 (*offset, "overwrite")
             }
+            EditAction::OverwriteMany { offset, after, .. } => {
+                self.cancel_search();
+                self.search.results.clear();
+                Arc::make_mut(&mut self.bytes)[*offset..*offset + after.len()]
+                    .copy_from_slice(after);
+                self.invalidate_entropy();
+                self.rebuild_display_rows();
+                self.refresh_modified_offsets();
+                (*offset, "overwrite")
+            }
             EditAction::Insert { offset, byte } => {
                 self.insert_bytes_at(*offset, &[*byte]);
+                (*offset, "insertion")
+            }
+            EditAction::InsertMany { offset, bytes } => {
+                self.insert_bytes_at(*offset, bytes);
                 (*offset, "insertion")
             }
             EditAction::Delete { offset, bytes } => {
@@ -3867,6 +4091,79 @@ fn write_clipboard_command(command: &mut Command, content: &str) -> Result<(), S
     }
 }
 
+#[cfg(windows)]
+fn read_clipboard() -> Result<String, String> {
+    let mut command = Command::new("powershell.exe");
+    command
+        .args([
+            "-NoProfile",
+            "-STA",
+            "-Command",
+            "[Console]::Out.Write((Get-Clipboard -Raw))",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .creation_flags(0x0800_0000);
+    let output = command
+        .output()
+        .map_err(|error| format!("could not start the clipboard command: {error}"))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    } else {
+        let error = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        Err(if error.is_empty() {
+            "clipboard command did not complete successfully".into()
+        } else {
+            error
+        })
+    }
+}
+
+#[cfg(not(windows))]
+fn read_clipboard() -> Result<String, String> {
+    #[cfg(target_os = "macos")]
+    let commands = vec![("pbpaste", Vec::new())];
+    #[cfg(not(target_os = "macos"))]
+    let commands = vec![
+        ("wl-paste", vec!["--no-newline"]),
+        ("xclip", vec!["-selection", "clipboard", "-o"]),
+        ("xsel", vec!["--clipboard", "--output"]),
+    ];
+
+    let mut errors = Vec::new();
+    for (program, args) in commands {
+        let output = Command::new(program)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output();
+        match output {
+            Ok(output) if output.status.success() => {
+                return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
+            }
+            Ok(output) => {
+                let error = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+                errors.push(format!(
+                    "{program}: {}",
+                    if error.is_empty() {
+                        "did not complete successfully".to_string()
+                    } else {
+                        error
+                    }
+                ));
+            }
+            Err(error) => errors.push(format!("{program}: could not start ({error})")),
+        }
+    }
+    Err(if errors.is_empty() {
+        "no clipboard command available".into()
+    } else {
+        errors.join("; ")
+    })
+}
+
 fn wrap_python_output(output: &str) -> Vec<String> {
     output
         .split('\n')
@@ -4239,6 +4536,111 @@ mod tests {
 
         app.redo_overwrite();
         assert_eq!(app.bytes.as_slice(), [0x12, 0xAA, 0xBB]);
+    }
+
+    #[test]
+    fn paste_from_clipboard_requires_byte_edit_mode() {
+        let mut app = App::new("sample.bin".into(), vec![0xAA, 0xBB]);
+        app.edit_mode = false;
+
+        app.paste_from_clipboard();
+
+        assert_eq!(app.bytes.as_slice(), [0xAA, 0xBB]);
+        assert!(app.status.contains("Enter Overwrite or Insert Mode"));
+    }
+
+    #[test]
+    fn pasted_hex_is_inserted_as_a_single_batched_edit() {
+        let mut app = App::new("sample.bin".into(), vec![0xAA, 0xBB]);
+        app.edit_mode = true;
+        app.edit_kind = EditKind::Insert;
+        app.selection = Some(Selection::new(1));
+
+        app.paste_hex_bytes("DE AD be ef");
+
+        assert_eq!(app.bytes.as_slice(), [0xAA, 0xDE, 0xAD, 0xBE, 0xEF, 0xBB]);
+        assert_eq!(app.undo_stack.len(), 1);
+
+        app.undo_overwrite();
+        assert_eq!(app.bytes.as_slice(), [0xAA, 0xBB]);
+
+        app.redo_overwrite();
+        assert_eq!(app.bytes.as_slice(), [0xAA, 0xDE, 0xAD, 0xBE, 0xEF, 0xBB]);
+    }
+
+    #[test]
+    fn pasted_hex_with_a_trailing_nibble_drops_the_incomplete_byte() {
+        let mut app = App::new("sample.bin".into(), vec![]);
+        app.edit_mode = true;
+        app.edit_kind = EditKind::Insert;
+
+        app.paste_hex_bytes("DEAD B");
+
+        assert_eq!(app.bytes.as_slice(), [0xDE, 0xAD]);
+        assert!(app.status.contains("trailing hex digit ignored"));
+    }
+
+    #[test]
+    fn pasted_hex_overwrites_in_place_and_truncates_at_end_of_file() {
+        let mut app = App::new("sample.bin".into(), vec![0, 0, 0, 0]);
+        app.edit_mode = true;
+        app.edit_kind = EditKind::Overwrite;
+        app.selection = Some(Selection::new(2));
+
+        app.paste_hex_bytes("DEADBEEF");
+
+        assert_eq!(app.bytes.as_slice(), [0, 0, 0xDE, 0xAD]);
+        assert!(app.status.contains("truncated"));
+
+        app.undo_overwrite();
+        assert_eq!(app.bytes.as_slice(), [0, 0, 0, 0]);
+
+        app.redo_overwrite();
+        assert_eq!(app.bytes.as_slice(), [0, 0, 0xDE, 0xAD]);
+    }
+
+    #[test]
+    fn pasting_a_large_hex_block_into_a_large_file_stays_fast() {
+        // Regression guard for the quadratic path this replaced: feeding each
+        // pasted nibble through the one-byte-at-a-time key handler re-shifts
+        // and re-scans the whole buffer per byte, which is O(file size *
+        // pasted size). With a 2 MiB file and a 100,000-byte paste that would
+        // take minutes; the batched path should finish in well under a second.
+        let mut app = App::new("sample.bin".into(), vec![0u8; 2_000_000]);
+        app.edit_mode = true;
+        app.edit_kind = EditKind::Insert;
+        app.selection = Some(Selection::new(1_000_000));
+        let hex: String = (0..100_000).map(|_| "AB").collect();
+
+        let start = std::time::Instant::now();
+        app.paste_hex_bytes(&hex);
+        let elapsed = start.elapsed();
+
+        assert_eq!(app.bytes.len(), 2_100_000);
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "batched paste took too long: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn workspace_paste_batches_hex_in_byte_edit_mode_but_falls_back_elsewhere() {
+        let mut workspace = Workspace::new(vec![App::new("sample.bin".into(), vec![0xAA, 0xBB])]);
+        workspace.active_mut().edit_mode = true;
+        workspace.active_mut().edit_kind = EditKind::Insert;
+        workspace.active_mut().selection = Some(Selection::new(0));
+
+        workspace.handle_workspace_paste("CC").unwrap();
+        assert_eq!(workspace.active().bytes.as_slice(), [0xCC, 0xAA, 0xBB]);
+        assert_eq!(workspace.active().undo_stack.len(), 1);
+
+        workspace.active_mut().edit_mode = false;
+        workspace.active_mut().mode = Mode::Search(TextInput::default());
+        workspace.handle_workspace_paste("needle").unwrap();
+        let Mode::Search(input) = &workspace.active().mode else {
+            panic!("search mode should remain open");
+        };
+        assert_eq!(input.value, "needle");
     }
 
     #[test]

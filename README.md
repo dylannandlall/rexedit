@@ -206,13 +206,13 @@ aligned.
 | `Ctrl+F` | Search the binary |
 | `n` / `N` | Next or previous search result |
 | `Ctrl+G` | Jump to an offset |
-| `Ctrl+C` / `Ctrl+Shift+C` | Copy all selected ranges as continuous hexadecimal, in file order (for example, `DEADBEEF`) |
+| `Ctrl+C` / `Ctrl+Shift+C` (`Cmd+C` on macOS) | Copy all selected ranges as continuous hexadecimal, in file order (for example, `DEADBEEF`) |
 | `Ctrl+U` / `Ctrl+R` | Undo or redo a byte overwrite |
 | `Ctrl+S` | Save the edited binary |
 | `a` | Create a field from the selection |
 | `Tab` | Switch between the viewer and field pane |
 | `Enter` | Edit the selected field |
-| `d` | Delete the selected field |
+| `d` / `Delete` | Delete the selected field |
 | `Ctrl+O` / `Ctrl+L` | Save or load an overlay |
 | `o` | Toggle field overlays |
 | `p` | Open the Python buffer console |
@@ -225,10 +225,30 @@ aligned.
 | Keys | Action |
 | --- | --- |
 | `0`–`9`, `A`–`F` | Overwrite the selected byte |
+| `Insert` / `i` | Toggle between Overwrite and Insert Mode |
+| `Backspace` / `Delete` | Delete the selected bytes |
 | Arrow keys | Move the byte cursor |
+| `Ctrl+C` / `Ctrl+Shift+C` (`Cmd+C` on macOS) | Copy all selected ranges as continuous hexadecimal |
+| `Ctrl+V` / `Ctrl+Shift+V` (`Cmd+V` on macOS) | Paste hexadecimal from the system clipboard at the cursor |
 | `Ctrl+U` / `Ctrl+R` | Undo or redo a byte overwrite |
 | `Ctrl+S` | Save the edited binary |
 | Escape | Return to View Mode |
+
+`i` toggles Overwrite/Insert Mode the same as the `Insert` key, for keyboards
+without a dedicated Insert key.
+
+Paste reads the system clipboard directly (PowerShell's clipboard on Windows;
+`pbpaste`, `wl-paste`, `xclip`, or `xsel` elsewhere) rather than relying on the
+terminal to relay pasted text, and decodes every hexadecimal digit it finds
+(ignoring spaces and other separators) as one batched edit. This is
+deliberate: terminal-relayed "bracketed paste" is unreliable on several
+platforms — most notably Windows, where it still arrives as a flood of
+individual keystrokes — so a paste through the terminal can be slow on a large
+clipboard. `Ctrl+V` / `Ctrl+Shift+V` (`Cmd+V` on macOS) is the fast, reliable
+path regardless of terminal support. Both the plain and Shift-modified chords
+do the same thing; use whichever matches habit on your platform (Windows and
+Linux terminals conventionally use `Ctrl+Shift+C`/`V`, macOS uses `Cmd+C`/`V`).
+Paste requires Overwrite or Insert Mode; from View Mode, press `i` first.
 
 Byte edits remain in memory until the binary is saved. Modified bytes are
 highlighted, and quitting with unsaved edits requires confirmation.
