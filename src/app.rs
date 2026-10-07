@@ -4021,17 +4021,30 @@ fn copy_to_clipboard(content: &str) -> Result<(), String> {
 
 #[cfg(not(windows))]
 fn copy_to_clipboard(content: &str) -> Result<(), String> {
+    // CLIPBOARD (Ctrl+V) is the authoritative selection: the second element of
+    // each tuple. The third, optional element additionally sets the PRIMARY
+    // selection (middle-click / mouse-highlight) on a best-effort basis, since
+    // some host/guest clipboard bridges (notably VMware Tools) only notice a
+    // selection change made through PRIMARY rather than CLIPBOARD.
     #[cfg(target_os = "macos")]
-    let commands = vec![("pbcopy", Vec::new())];
+    let commands = vec![("pbcopy", Vec::new(), None)];
     #[cfg(not(target_os = "macos"))]
     let commands = vec![
-        ("wl-copy", Vec::new()),
-        ("xclip", vec!["-selection", "clipboard"]),
-        ("xsel", vec!["--clipboard", "--input"]),
+        ("wl-copy", Vec::new(), Some(vec!["--primary"])),
+        (
+            "xclip",
+            vec!["-selection", "clipboard"],
+            Some(vec!["-selection", "primary"]),
+        ),
+        (
+            "xsel",
+            vec!["--clipboard", "--input"],
+            Some(vec!["--primary", "--input"]),
+        ),
     ];
 
     let mut errors = Vec::new();
-    for (program, args) in commands {
+    for (program, args, primary_args) in commands {
         let mut command = Command::new(program);
         command
             .args(args)
@@ -4039,7 +4052,18 @@ fn copy_to_clipboard(content: &str) -> Result<(), String> {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         match write_clipboard_command(&mut command, content) {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                if let Some(primary_args) = primary_args {
+                    let mut primary_command = Command::new(program);
+                    primary_command
+                        .args(primary_args)
+                        .stdin(Stdio::piped())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null());
+                    let _ = write_clipboard_command(&mut primary_command, content);
+                }
+                return Ok(());
+            }
             Err(error) => errors.push(format!("{program}: {error}")),
         }
     }
