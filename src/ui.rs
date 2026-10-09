@@ -16,6 +16,7 @@ use crate::app::{
     ThemeEditor, Workspace,
 };
 use crate::inspector_plugins;
+use crate::model::FieldColor;
 
 // A 16-byte row with offsets and ASCII needs 77 inner columns. Leave room for
 // both viewer borders so the sidebar border never overwrites the final ASCII
@@ -618,6 +619,12 @@ fn byte_style(app: &App, offset: usize, byte: u8, ascii: bool) -> Style {
         style = style
             .fg(field.color.color())
             .add_modifier(Modifier::UNDERLINED);
+        // Background is independent of (and always shown alongside) the
+        // foreground/underline above; picking a background that contrasts
+        // with the field's text color is left to the user.
+        if let Some(background) = field.background {
+            style = style.bg(background.color());
+        }
     }
     if app.modified_offsets.contains(&offset) {
         style = style
@@ -686,6 +693,15 @@ fn render_fields(frame: &mut Frame, app: &App, area: Rect) {
             Line::from(vec![
                 Span::styled("Color: ", Style::default().fg(Color::DarkGray)),
                 Span::styled(field.color.name(), Style::default().fg(field.color.color())),
+            ]),
+            Line::from(vec![
+                Span::styled("Background: ", Style::default().fg(Color::DarkGray)),
+                field.background.map_or_else(
+                    || Span::styled("none", Style::default().fg(Color::DarkGray)),
+                    |background| {
+                        Span::styled(background.name(), Style::default().fg(background.color()))
+                    },
+                ),
             ]),
             Line::from(vec![
                 Span::styled("Description: ", Style::default().fg(Color::DarkGray)),
@@ -1253,7 +1269,7 @@ fn caret_spans(value: &str, cursor: usize, style: Style, show_caret: bool) -> Ve
 }
 
 fn render_field_modal(frame: &mut Frame, editor: &FieldEditor) {
-    let area = centered_rect(frame.area(), 72, 13);
+    let area = centered_rect(frame.area(), 72, 14);
     frame.render_widget(Clear, area);
     let text_rows = [
         ("Name", &editor.name),
@@ -1282,6 +1298,14 @@ fn render_field_modal(frame: &mut Frame, editor: &FieldEditor) {
     lines.push(Line::styled(
         format!(" {:<12} {}", "Color", editor.color.name()),
         selected_row(editor.active == 4),
+    ));
+    lines.push(Line::styled(
+        format!(
+            " {:<12} {}",
+            "Background",
+            editor.background.map_or("none", FieldColor::name)
+        ),
+        selected_row(editor.active == 5),
     ));
     lines.extend([
         Line::from(""),
@@ -2000,6 +2024,7 @@ mod tests {
             start: 1,
             end: 2,
             color: crate::model::FieldColor::Cyan,
+            background: None,
         });
         app.selected_field = 0;
         let rendered = inspector_lines(&app)
@@ -2027,6 +2052,7 @@ mod tests {
             start: 0,
             end: 1,
             color: crate::model::FieldColor::Cyan,
+            background: None,
         });
         assert_eq!(app.fields[0].name.chars().count(), MAX_FIELD_NAME_WIDTH);
         app.visible_fields = 5;
@@ -2059,6 +2085,7 @@ mod tests {
             start: 0,
             end: 1,
             color: crate::model::FieldColor::Cyan,
+            background: None,
         });
         app.visible_fields = 5;
         let area = Rect::new(0, 0, 30, 20);
@@ -2076,6 +2103,44 @@ mod tests {
                     output
                 });
         assert!(!rendered.contains("exactly thirty two characters!!!"));
+    }
+
+    #[test]
+    fn field_background_coexists_with_the_foreground_and_underline() {
+        let mut app = App::new(PathBuf::from("sample.bin"), vec![0x41]);
+        app.selection = None; // isolate field styling from selection highlighting
+        app.fields.push(crate::model::Field {
+            name: "field".into(),
+            description: String::new(),
+            start: 0,
+            end: 0,
+            color: FieldColor::Red,
+            background: Some(FieldColor::LightBlue),
+        });
+
+        let style = byte_style(&app, 0, 0x41, false);
+        assert_eq!(style.fg, Some(FieldColor::Red.color()));
+        assert_eq!(style.bg, Some(FieldColor::LightBlue.color()));
+        assert!(style.add_modifier.contains(Modifier::UNDERLINED));
+    }
+
+    #[test]
+    fn a_field_without_a_background_leaves_it_unset() {
+        let mut app = App::new(PathBuf::from("sample.bin"), vec![0x41]);
+        app.selection = None; // isolate field styling from selection highlighting
+        app.fields.push(crate::model::Field {
+            name: "field".into(),
+            description: String::new(),
+            start: 0,
+            end: 0,
+            color: FieldColor::Red,
+            background: None,
+        });
+
+        let style = byte_style(&app, 0, 0x41, false);
+        assert_eq!(style.fg, Some(FieldColor::Red.color()));
+        assert_eq!(style.bg, None);
+        assert!(style.add_modifier.contains(Modifier::UNDERLINED));
     }
 
     #[test]

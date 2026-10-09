@@ -290,8 +290,18 @@ selections, rexedit creates one identically colored field per range. Fields supp
 
 - editable start and end offsets;
 - a name and description;
-- a display color;
+- a display color, shown as the field's text color and underline;
+- an independent background color, shaded behind the field's bytes in both
+  the hex and ASCII columns;
 - selection, updating, and deletion.
+
+The text color/underline and the background always show together — there is
+no setting to show one without the other. Background defaults to "none" (no
+shading, matching rexedit's previous look); in the field editor, Tab to the
+"Background" row and use Left/Right to cycle through "none" and the same
+14 colors offered for the text color. rexedit does not try to pick a
+background that contrasts with the text color for you — choosing a
+combination that stays readable is up to you.
 
 Overlays are stored as JSON files and can be saved or loaded using user-selected
 paths. The suggested filename is:

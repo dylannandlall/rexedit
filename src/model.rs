@@ -34,13 +34,19 @@ impl Selection {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct Field {
     pub name: String,
     pub description: String,
     pub start: usize,
     pub end: usize,
     pub color: FieldColor,
+    /// Background shading behind the field's bytes, independent of `color`.
+    /// `None` keeps today's look (foreground color + underline only).
+    /// Picking a background that contrasts with `color` is left to the
+    /// user; rexedit does not derive one from the other.
+    pub background: Option<FieldColor>,
 }
 
 impl Field {
@@ -141,15 +147,44 @@ impl FieldColor {
     }
 }
 
+/// Cycles a field's optional background color, inserting "no background"
+/// (`None`) between the end of `FieldColor::ALL` and its start.
+pub fn cycle_field_background(current: Option<FieldColor>, forward: bool) -> Option<FieldColor> {
+    let last = *FieldColor::ALL
+        .last()
+        .expect("FieldColor::ALL is non-empty");
+    let first = FieldColor::ALL[0];
+    match (current, forward) {
+        (None, true) => Some(first),
+        (None, false) => Some(last),
+        (Some(color), true) if color == last => None,
+        (Some(color), false) if color == first => None,
+        (Some(color), true) => Some(color.next()),
+        (Some(color), false) => Some(color.previous()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::FieldColor;
+    use super::{FieldColor, cycle_field_background};
 
     #[test]
     fn field_colors_cycle_in_both_directions() {
         assert_eq!(FieldColor::Cyan.next(), FieldColor::Green);
         assert_eq!(FieldColor::Cyan.previous(), FieldColor::Gray);
         assert_eq!(FieldColor::Gray.next(), FieldColor::Cyan);
+    }
+
+    #[test]
+    fn field_background_cycles_through_none_at_both_ends() {
+        assert_eq!(cycle_field_background(None, true), Some(FieldColor::Cyan));
+        assert_eq!(cycle_field_background(Some(FieldColor::Gray), true), None);
+        assert_eq!(cycle_field_background(None, false), Some(FieldColor::Gray));
+        assert_eq!(cycle_field_background(Some(FieldColor::Cyan), false), None);
+        assert_eq!(
+            cycle_field_background(Some(FieldColor::Cyan), true),
+            Some(FieldColor::Green)
+        );
     }
 }
 
