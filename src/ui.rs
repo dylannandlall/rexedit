@@ -11,16 +11,22 @@ use ratatui::{
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::app::{
-    App, DisplayRow, FieldEditor, Focus, HelpViewer, Mode, OpenFileDialog,
+    App, DisplayRow, EditKind, FieldEditor, Focus, HelpViewer, Mode, OpenFileDialog,
     PATH_SUGGESTION_PAGE_SIZE, PathAction, PathDialog, PythonPane, ResetTarget, SettingsEditor,
     ThemeEditor, Workspace,
 };
+use crate::inspector_plugins;
+use crate::model::FieldColor;
 
 // A 16-byte row with offsets and ASCII needs 77 inner columns. Leave room for
 // both viewer borders so the sidebar border never overwrites the final ASCII
 // character when the terminal is narrowed.
 const VIEWER_MIN_WIDTH: u16 = 79;
-const SIDEBAR_WIDTH: u16 = 41;
+// Wide enough for a marker, a space, a full 32-character field name, a space,
+// an 8-digit offset range ("########-########"), and both borders. Shrinks
+// below this when the terminal is too narrow to fit the viewer as well.
+const SIDEBAR_WIDTH: u16 = 54;
+const MAX_FIELD_NAME_WIDTH: usize = 32;
 
 pub fn render_workspace(frame: &mut Frame, workspace: &mut Workspace) {
     let [tabs, content] =
@@ -613,6 +619,12 @@ fn byte_style(app: &App, offset: usize, byte: u8, ascii: bool) -> Style {
         style = style
             .fg(field.color.color())
             .add_modifier(Modifier::UNDERLINED);
+        // Background is independent of (and always shown alongside) the
+        // foreground/underline above; picking a background that contrasts
+        // with the field's text color is left to the user.
+        if let Some(background) = field.background {
+            style = style.bg(background.color());
+        }
     }
     if app.modified_offsets.contains(&offset) {
         style = style
@@ -636,6 +648,13 @@ fn byte_style(app: &App, offset: usize, byte: u8, ascii: bool) -> Style {
 fn render_fields(frame: &mut Frame, app: &App, area: Rect) {
     let mut lines = Vec::new();
     let list_height = app.visible_fields;
+    // "########-########" is 17 characters; the marker and its two
+    // neighboring spaces add 3 more.
+    const LINE_OVERHEAD: usize = 3 + 17;
+    let name_width = (area.width as usize)
+        .saturating_sub(2) // borders
+        .saturating_sub(LINE_OVERHEAD)
+        .min(MAX_FIELD_NAME_WIDTH);
     for (index, field) in app
         .fields
         .iter()
@@ -655,10 +674,10 @@ fn render_fields(frame: &mut Frame, app: &App, area: Rect) {
         };
         lines.push(Line::from(Span::styled(
             format!(
-                "{marker} {:<16} {:08X}-{:08X}",
-                truncate(&field.name, 16),
+                "{marker} {name:<name_width$} {:08X}-{:08X}",
                 field.start,
-                field.end
+                field.end,
+                name = truncate(&field.name, name_width),
             ),
             style,
         )));
@@ -674,6 +693,15 @@ fn render_fields(frame: &mut Frame, app: &App, area: Rect) {
             Line::from(vec![
                 Span::styled("Color: ", Style::default().fg(Color::DarkGray)),
                 Span::styled(field.color.name(), Style::default().fg(field.color.color())),
+            ]),
+            Line::from(vec![
+                Span::styled("Background: ", Style::default().fg(Color::DarkGray)),
+                field.background.map_or_else(
+                    || Span::styled("none", Style::default().fg(Color::DarkGray)),
+                    |background| {
+                        Span::styled(background.name(), Style::default().fg(background.color()))
+                    },
+                ),
             ]),
             Line::from(vec![
                 Span::styled("Description: ", Style::default().fg(Color::DarkGray)),
@@ -756,7 +784,16 @@ fn inspector_lines(app: &App) -> Vec<Line<'static>> {
         .collect::<Vec<_>>()
         .join(" ");
 
-    let mut lines = vec![
+    let mut lines = Vec::new();
+    if let Some(field) = app.fields.get(app.selected_field) {
+        lines.push(kv("Field", field.name.clone()));
+        lines.push(Line::from(vec![
+            Span::styled("Description: ", Style::default().fg(Color::DarkGray)),
+            Span::raw(field.description.clone()),
+        ]));
+        lines.push(Line::from(""));
+    }
+    lines.extend([
         kv(
             "Range",
             format!(
@@ -771,7 +808,7 @@ fn inspector_lines(app: &App) -> Vec<Line<'static>> {
         kv("Selected", format!("0x{hex} ({decimal})")),
         kv("ASCII", ascii),
         kv("Binary", binary),
-    ];
+    ]);
     if let Some(byte) = bytes.first() {
         lines.push(kv("u8 / i8", format!("{byte} / {}", *byte as i8)));
     }
@@ -780,7 +817,40 @@ fn inspector_lines(app: &App) -> Vec<Line<'static>> {
     if !bytes.is_empty() {
         lines.push(kv("UTF-8", utf8_preview(bytes)));
     }
+    add_inspector_plugin_lines(&mut lines, app);
     lines
+}
+
+/// Appends one row per user-defined inspector plugin (see
+/// `inspector_plugins`), in discovery order. Plugins only run when the user
+/// presses `r` (`App::run_inspector_plugins`); a row shows the last result
+/// from that run until `r` is pressed again.
+fn add_inspector_plugin_lines(lines: &mut Vec<Line<'static>>, app: &App) {
+    if app.inspector_plugins.is_empty() {
+        return;
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::styled(
+        "Custom [r to run]",
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    ));
+    let running = app.inspector_plugins_running();
+    for plugin in &app.inspector_plugins {
+        let value = app
+            .inspector_plugin_results
+            .get(&plugin.name)
+            .cloned()
+            .unwrap_or_else(|| {
+                if running {
+                    inspector_plugins::PENDING_PLACEHOLDER.to_string()
+                } else {
+                    inspector_plugins::NOT_RUN_PLACEHOLDER.to_string()
+                }
+            });
+        lines.push(kv(&plugin.name, value));
+    }
 }
 
 fn add_integer_lines(lines: &mut Vec<Line<'static>>, bytes: &[u8]) {
@@ -920,10 +990,15 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
             app.search.results.len()
         )
     };
-    let mode = if app.edit_mode {
-        format!(" | {} Mode", app.edit_kind.name())
+    let mode_span = if app.edit_mode {
+        Span::styled(
+            format!(" | {} Mode", app.edit_kind.name()),
+            Style::default()
+                .fg(edit_kind_color(app.edit_kind))
+                .add_modifier(Modifier::BOLD),
+        )
     } else {
-        " | View Mode".into()
+        Span::raw(" | View Mode")
     };
     let first = Line::from(vec![
         Span::styled(
@@ -931,17 +1006,18 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().add_modifier(Modifier::BOLD),
         ),
         Span::raw(format!(
-            "| {} bytes | {} fields | {}{dirty}{search}{mode}",
+            "| {} bytes | {} fields | {}{dirty}{search}",
             app.bytes.len(),
             app.fields.len(),
             selection_location_summary(app),
         )),
+        mode_span,
     ]);
     let second = Line::styled(&app.status, Style::default().fg(Color::Cyan));
     let help = if app.edit_mode {
-        "Ctrl+B then Left/Right binary | Insert/i switches overwrite/insert | Del removes selection | Ctrl+U/R undo/redo | Ctrl+S save | Esc View Mode | ? keybinds"
+        "Ctrl+B then Left/Right binary | Insert/i switches overwrite/insert | Del removes selection | Ctrl+U/R undo/redo | Ctrl+S save | r run plugins | Esc View Mode | ? keybinds"
     } else {
-        "Ctrl+B then Left/Right binary, S compare | Ctrl+U/R undo/redo | Ctrl+S save | Ctrl+F search | i edit | ? keybinds"
+        "Ctrl+B then Left/Right binary, S compare | Ctrl+U/R undo/redo | Ctrl+S save | Ctrl+F search | i edit | r run plugins | ? keybinds"
     };
     let third = Line::styled(help, Style::default().fg(Color::DarkGray));
     frame.render_widget(Paragraph::new(vec![first, second, third]), area);
@@ -1193,7 +1269,7 @@ fn caret_spans(value: &str, cursor: usize, style: Style, show_caret: bool) -> Ve
 }
 
 fn render_field_modal(frame: &mut Frame, editor: &FieldEditor) {
-    let area = centered_rect(frame.area(), 72, 13);
+    let area = centered_rect(frame.area(), 72, 14);
     frame.render_widget(Clear, area);
     let text_rows = [
         ("Name", &editor.name),
@@ -1222,6 +1298,14 @@ fn render_field_modal(frame: &mut Frame, editor: &FieldEditor) {
     lines.push(Line::styled(
         format!(" {:<12} {}", "Color", editor.color.name()),
         selected_row(editor.active == 4),
+    ));
+    lines.push(Line::styled(
+        format!(
+            " {:<12} {}",
+            "Background",
+            editor.background.map_or("none", FieldColor::name)
+        ),
+        selected_row(editor.active == 5),
     ));
     lines.extend([
         Line::from(""),
@@ -1642,6 +1726,7 @@ fn keybinding_lines() -> Vec<Line<'static>> {
         binding("s", "open viewer settings"),
         binding("t", "open theme customization"),
         binding("p", "open the Python buffer console"),
+        binding("r", "run inspector plugins against the current selection"),
         Line::from(""),
         section("Byte Edit Mode"),
         binding("0-9, A-F", "overwrite the selected byte, two nibbles"),
@@ -1671,6 +1756,7 @@ fn keybinding_lines() -> Vec<Line<'static>> {
             "undo / redo overwrite, insertion, or deletion",
         ),
         binding("Ctrl+S", "save the edited binary"),
+        binding("r", "run inspector plugins against the current selection"),
         binding("Escape", "return to View Mode"),
         Line::from(""),
         section("Search syntax"),
@@ -1763,7 +1849,7 @@ fn title_style(app: &App, active: bool) -> Style {
 fn viewer_title_style(app: &App) -> Style {
     if app.edit_mode {
         Style::default()
-            .fg(Color::LightRed)
+            .fg(edit_kind_color(app.edit_kind))
             .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
     } else {
         title_style(app, app.focus == Focus::Viewer)
@@ -1772,9 +1858,18 @@ fn viewer_title_style(app: &App) -> Style {
 
 fn viewer_border_style(app: &App) -> Style {
     if app.edit_mode {
-        Style::default().fg(Color::LightRed)
+        Style::default().fg(edit_kind_color(app.edit_kind))
     } else {
         border_style(app, app.focus == Focus::Viewer)
+    }
+}
+
+/// Overwrite Mode stays red; Insert Mode is orange so the two are
+/// distinguishable at a glance while editing binaries.
+fn edit_kind_color(edit_kind: EditKind) -> Color {
+    match edit_kind {
+        EditKind::Overwrite => Color::LightRed,
+        EditKind::Insert => Color::Rgb(255, 165, 0),
     }
 }
 
@@ -1828,10 +1923,19 @@ mod tests {
 
     #[test]
     fn sidebar_leaves_room_for_ascii_and_ends_with_the_viewer() {
-        let (viewer, sidebar) = split_viewer_and_sidebar(Rect::new(0, 0, 120, 36));
+        let (viewer, sidebar) =
+            split_viewer_and_sidebar(Rect::new(0, 0, VIEWER_MIN_WIDTH + SIDEBAR_WIDTH, 36));
         assert_eq!(viewer.width, VIEWER_MIN_WIDTH);
         assert_eq!(sidebar.width, SIDEBAR_WIDTH);
         assert_eq!(viewer.bottom(), sidebar.bottom());
+    }
+
+    #[test]
+    fn sidebar_shrinks_below_its_preferred_width_on_a_narrow_terminal() {
+        let (viewer, sidebar) = split_viewer_and_sidebar(Rect::new(0, 0, 120, 36));
+        assert_eq!(viewer.width, VIEWER_MIN_WIDTH);
+        assert_eq!(sidebar.width, 120 - VIEWER_MIN_WIDTH);
+        assert!(sidebar.width < SIDEBAR_WIDTH);
     }
 
     #[test]
@@ -1905,6 +2009,138 @@ mod tests {
             .join("\n");
         assert!(rendered.contains("0x1 to 0x2 (1 to 2)"));
         assert!(rendered.contains("0xDE AD (222, 173)"));
+    }
+
+    #[test]
+    fn inspector_shows_the_highlighted_fields_full_name_and_description() {
+        let mut app = App::new(PathBuf::from("sample.bin"), vec![0, 0xDE, 0xAD]);
+        app.selection = Some(crate::model::Selection {
+            anchor: 1,
+            cursor: 2,
+        });
+        app.fields.push(crate::model::Field {
+            name: "a very long field name past sixteen chars".into(),
+            description: "a fairly detailed description of what this field means".into(),
+            start: 1,
+            end: 2,
+            color: crate::model::FieldColor::Cyan,
+            background: None,
+        });
+        app.selected_field = 0;
+        let rendered = inspector_lines(&app)
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("a very long field name past sixteen chars"));
+        assert!(rendered.contains("a fairly detailed description of what this field means"));
+    }
+
+    #[test]
+    fn field_pane_shows_the_full_name_when_width_allows() {
+        let backend = TestBackend::new(SIDEBAR_WIDTH, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new(PathBuf::from("sample.bin"), vec![0, 1, 2]);
+        app.fields.push(crate::model::Field {
+            name: "exactly thirty two characters!!!".into(),
+            description: String::new(),
+            start: 0,
+            end: 1,
+            color: crate::model::FieldColor::Cyan,
+            background: None,
+        });
+        assert_eq!(app.fields[0].name.chars().count(), MAX_FIELD_NAME_WIDTH);
+        app.visible_fields = 5;
+        let area = Rect::new(0, 0, SIDEBAR_WIDTH, 20);
+        terminal
+            .draw(|frame| render_fields(frame, &app, area))
+            .unwrap();
+        let rendered =
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .fold(String::new(), |mut output, cell| {
+                    output.push_str(cell.symbol());
+                    output
+                });
+        assert!(rendered.contains("exactly thirty two characters!!!"));
+        assert!(!rendered.contains('…'));
+    }
+
+    #[test]
+    fn field_pane_truncates_the_name_on_a_narrow_pane() {
+        let backend = TestBackend::new(30, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new(PathBuf::from("sample.bin"), vec![0, 1, 2]);
+        app.fields.push(crate::model::Field {
+            name: "exactly thirty two characters!!!".into(),
+            description: String::new(),
+            start: 0,
+            end: 1,
+            color: crate::model::FieldColor::Cyan,
+            background: None,
+        });
+        app.visible_fields = 5;
+        let area = Rect::new(0, 0, 30, 20);
+        terminal
+            .draw(|frame| render_fields(frame, &app, area))
+            .unwrap();
+        let rendered =
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .fold(String::new(), |mut output, cell| {
+                    output.push_str(cell.symbol());
+                    output
+                });
+        assert!(!rendered.contains("exactly thirty two characters!!!"));
+    }
+
+    #[test]
+    fn field_background_coexists_with_the_foreground_and_underline() {
+        let mut app = App::new(PathBuf::from("sample.bin"), vec![0x41]);
+        app.selection = None; // isolate field styling from selection highlighting
+        app.fields.push(crate::model::Field {
+            name: "field".into(),
+            description: String::new(),
+            start: 0,
+            end: 0,
+            color: FieldColor::Red,
+            background: Some(FieldColor::LightBlue),
+        });
+
+        let style = byte_style(&app, 0, 0x41, false);
+        assert_eq!(style.fg, Some(FieldColor::Red.color()));
+        assert_eq!(style.bg, Some(FieldColor::LightBlue.color()));
+        assert!(style.add_modifier.contains(Modifier::UNDERLINED));
+    }
+
+    #[test]
+    fn a_field_without_a_background_leaves_it_unset() {
+        let mut app = App::new(PathBuf::from("sample.bin"), vec![0x41]);
+        app.selection = None; // isolate field styling from selection highlighting
+        app.fields.push(crate::model::Field {
+            name: "field".into(),
+            description: String::new(),
+            start: 0,
+            end: 0,
+            color: FieldColor::Red,
+            background: None,
+        });
+
+        let style = byte_style(&app, 0, 0x41, false);
+        assert_eq!(style.fg, Some(FieldColor::Red.color()));
+        assert_eq!(style.bg, None);
+        assert!(style.add_modifier.contains(Modifier::UNDERLINED));
     }
 
     #[test]

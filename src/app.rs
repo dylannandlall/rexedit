@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap},
     env, fs,
     io::{self},
     path::{Path, PathBuf},
@@ -31,9 +31,10 @@ use ratatui::{DefaultTerminal, layout::Rect};
 
 use crate::{
     entropy::{self, EntropyMessage, EntropyWorker},
+    inspector_plugins::{self, Plugin as InspectorPlugin, PluginWorker as InspectorPluginWorker},
     model::{
         ByteColorMode, DEFAULT_BYTES_PER_ROW, Field, FieldColor, NamedColor, Overlay, SearchMatch,
-        Selection, Theme,
+        Selection, Theme, cycle_field_background,
     },
     python::{PythonDocument, PythonSession, PythonSnapshot},
     search::{self, SearchMessage, SearchWorker},
@@ -229,11 +230,14 @@ pub struct FieldEditor {
     pub start: TextInput,
     pub end: TextInput,
     pub color: FieldColor,
+    pub background: Option<FieldColor>,
     pub active: usize,
     ranges: Vec<Selection>,
 }
 
 impl FieldEditor {
+    const FIELD_COUNT: usize = 6;
+
     fn new() -> Self {
         Self {
             editing: None,
@@ -242,6 +246,7 @@ impl FieldEditor {
             start: TextInput::default(),
             end: TextInput::default(),
             color: FieldColor::default(),
+            background: None,
             active: 0,
             ranges: Vec::new(),
         }
@@ -255,6 +260,7 @@ impl FieldEditor {
             start: TextInput::with_value(format!("0x{:X}", field.start)),
             end: TextInput::with_value(format!("0x{:X}", field.end)),
             color: field.color,
+            background: field.background,
             active: 0,
             ranges: Vec::new(),
         }
@@ -268,6 +274,10 @@ impl FieldEditor {
             3 => Some(&mut self.end),
             _ => None,
         }
+    }
+
+    fn cycle_background(&mut self, forward: bool) {
+        self.background = cycle_field_background(self.background, forward);
     }
 
     fn handle_text_key(&mut self, key: KeyEvent) {
@@ -484,6 +494,9 @@ pub struct App {
     entropy_worker: Option<EntropyWorker>,
     pub entropy_scanned: usize,
     pub entropy_total: usize,
+    pub inspector_plugins: Vec<InspectorPlugin>,
+    pub inspector_plugin_results: HashMap<String, String>,
+    inspector_plugin_worker: Option<InspectorPluginWorker>,
 }
 
 impl App {
@@ -528,6 +541,9 @@ impl App {
             entropy_worker: None,
             entropy_scanned: 0,
             entropy_total: 0,
+            inspector_plugins: discover_inspector_plugins(),
+            inspector_plugin_results: HashMap::new(),
+            inspector_plugin_worker: None,
         };
         if app.path.is_file() {
             match app.restore_automatic_overlay() {
@@ -592,6 +608,67 @@ impl App {
         self.entropy = None;
         self.entropy_scanned = 0;
         self.entropy_total = 0;
+    }
+
+    /// Folds in whatever inspector plugin results have arrived since the
+    /// last tick. Cheap to call every tick even when no run is in flight.
+    pub fn poll_inspector_plugins(&mut self) {
+        self.drain_inspector_plugin_messages();
+    }
+
+    pub fn inspector_plugins_running(&self) -> bool {
+        self.inspector_plugin_worker.is_some()
+    }
+
+    /// Runs every discovered inspector plugin once against the current byte
+    /// selection. This is manually triggered (bound to `r`) rather than
+    /// running automatically on every selection change, since even a
+    /// handful of slow (e.g. Python-based) scripts firing on every mouse
+    /// drag or held arrow key adds up; see `inspector_plugins`.
+    pub fn run_inspector_plugins(&mut self) {
+        if self.inspector_plugins.is_empty() {
+            self.status = "No inspector plugins installed".into();
+            return;
+        }
+        if self.selection.is_none() {
+            self.status = "Select bytes to run inspector plugins".into();
+            return;
+        }
+        let capped = {
+            let bytes = self.current_bytes();
+            bytes[..bytes.len().min(inspector_plugins::MAX_INPUT_BYTES)].to_vec()
+        };
+        if let Some(worker) = self.inspector_plugin_worker.take() {
+            worker.cancel();
+        }
+        self.inspector_plugin_results.clear();
+        self.inspector_plugin_worker = Some(inspector_plugins::spawn(
+            self.inspector_plugins.clone(),
+            capped,
+        ));
+        self.status = format!(
+            "Running {} inspector plugin(s)…",
+            self.inspector_plugins.len()
+        );
+    }
+
+    fn drain_inspector_plugin_messages(&mut self) {
+        let Some(worker) = &self.inspector_plugin_worker else {
+            return;
+        };
+        loop {
+            match worker.receiver.try_recv() {
+                Ok(outcome) => {
+                    self.inspector_plugin_results
+                        .insert(outcome.name, outcome.value);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.inspector_plugin_worker = None;
+                    break;
+                }
+            }
+        }
     }
 
     fn automatic_overlay_path(&self) -> PathBuf {
@@ -692,6 +769,7 @@ impl Workspace {
             for document in &mut self.documents {
                 document.drain_search_messages();
                 document.drain_entropy_messages();
+                document.poll_inspector_plugins();
                 snapshots.extend(document.drain_python_messages());
             }
             self.update_entropy_status();
@@ -1595,6 +1673,7 @@ impl App {
             }
             KeyCode::Char('n') => self.next_search_result(),
             KeyCode::Char('N') => self.previous_search_result(),
+            KeyCode::Char('r') => self.run_inspector_plugins(),
             KeyCode::Tab => {
                 self.focus = match self.focus {
                     Focus::Viewer => Focus::Fields,
@@ -1704,6 +1783,7 @@ impl App {
             }
             KeyCode::Insert | KeyCode::Char('i') => self.toggle_edit_kind(),
             KeyCode::Backspace | KeyCode::Delete => self.delete_selected_bytes(),
+            KeyCode::Char('r') => self.run_inspector_plugins(),
             KeyCode::Char(character) if character.is_ascii_hexdigit() => {
                 let nibble = character.to_digit(16).expect("checked hex digit") as u8;
                 self.edit_nibble(nibble);
@@ -1812,7 +1892,7 @@ impl App {
             KeyCode::Esc => self.mode = Mode::Normal,
             KeyCode::Tab | KeyCode::Down => {
                 if let Mode::Field(editor) = &mut self.mode {
-                    editor.active = (editor.active + 1) % 5;
+                    editor.active = (editor.active + 1) % FieldEditor::FIELD_COUNT;
                     if let Some(input) = editor.active_text_mut() {
                         input.selected = !input.value.is_empty();
                     }
@@ -1820,28 +1900,31 @@ impl App {
             }
             KeyCode::BackTab | KeyCode::Up => {
                 if let Mode::Field(editor) = &mut self.mode {
-                    editor.active = editor.active.checked_sub(1).unwrap_or(4);
+                    editor.active = editor
+                        .active
+                        .checked_sub(1)
+                        .unwrap_or(FieldEditor::FIELD_COUNT - 1);
                     if let Some(input) = editor.active_text_mut() {
                         input.selected = !input.value.is_empty();
                     }
                 }
             }
             KeyCode::Left => {
-                if let Mode::Field(editor) = &mut self.mode
-                    && editor.active == 4
-                {
-                    editor.color = editor.color.previous();
-                } else if let Mode::Field(editor) = &mut self.mode {
-                    editor.handle_text_key(key);
+                if let Mode::Field(editor) = &mut self.mode {
+                    match editor.active {
+                        4 => editor.color = editor.color.previous(),
+                        5 => editor.cycle_background(false),
+                        _ => editor.handle_text_key(key),
+                    }
                 }
             }
             KeyCode::Right => {
-                if let Mode::Field(editor) = &mut self.mode
-                    && editor.active == 4
-                {
-                    editor.color = editor.color.next();
-                } else if let Mode::Field(editor) = &mut self.mode {
-                    editor.handle_text_key(key);
+                if let Mode::Field(editor) = &mut self.mode {
+                    match editor.active {
+                        4 => editor.color = editor.color.next(),
+                        5 => editor.cycle_background(true),
+                        _ => editor.handle_text_key(key),
+                    }
                 }
             }
             KeyCode::Enter => self.commit_field_editor(),
@@ -3406,6 +3489,7 @@ impl App {
                 start,
                 end,
                 color: editor.color,
+                background: editor.background,
             };
             self.selected_field = index;
             self.status = "Field updated".into();
@@ -3413,6 +3497,7 @@ impl App {
             let ranges = editor.ranges.clone();
             let description = editor.description.value.trim().to_owned();
             let color = editor.color;
+            let background = editor.background;
             let added = ranges.len();
             for (index, range) in ranges.into_iter().enumerate() {
                 self.fields.push(Field {
@@ -3425,6 +3510,7 @@ impl App {
                     start: range.start(),
                     end: range.end(),
                     color,
+                    background,
                 });
             }
             self.selected_field = self.fields.len().saturating_sub(1);
@@ -3436,6 +3522,7 @@ impl App {
                 start,
                 end,
                 color: editor.color,
+                background: editor.background,
             });
             self.selected_field = self.fields.len() - 1;
             self.status = "Field added".into();
@@ -3771,9 +3858,24 @@ impl App {
 }
 
 fn overlay_storage_dir() -> PathBuf {
+    rexedit_data_dir("overlays")
+}
+
+fn discover_inspector_plugins() -> Vec<InspectorPlugin> {
+    let directory = inspector_plugins::default_directory();
+    // Best-effort: create the directory so it's there to find, but a
+    // failure (read-only filesystem, etc.) just means no plugins.
+    let _ = fs::create_dir_all(&directory);
+    inspector_plugins::discover(&directory)
+}
+
+/// `<platform data dir>/rexedit/<subdir>` (`%APPDATA%` on Windows,
+/// `~/Library/Application Support` on macOS, `$XDG_DATA_HOME` or
+/// `~/.local/share` elsewhere).
+pub(crate) fn rexedit_data_dir(subdir: &str) -> PathBuf {
     #[cfg(windows)]
     if let Some(directory) = env::var_os("APPDATA") {
-        return PathBuf::from(directory).join("rexedit").join("overlays");
+        return PathBuf::from(directory).join("rexedit").join(subdir);
     }
 
     #[cfg(target_os = "macos")]
@@ -3782,18 +3884,18 @@ fn overlay_storage_dir() -> PathBuf {
             .join("Library")
             .join("Application Support")
             .join("rexedit")
-            .join("overlays");
+            .join(subdir);
     }
 
     if let Some(directory) = env::var_os("XDG_DATA_HOME") {
-        return PathBuf::from(directory).join("rexedit").join("overlays");
+        return PathBuf::from(directory).join("rexedit").join(subdir);
     }
     user_home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".local")
         .join("share")
         .join("rexedit")
-        .join("overlays")
+        .join(subdir)
 }
 
 fn user_home_dir() -> Option<PathBuf> {
@@ -4677,6 +4779,7 @@ mod tests {
                 start: 0,
                 end: 0,
                 color: FieldColor::Cyan,
+                background: None,
             },
             Field {
                 name: "after".into(),
@@ -4684,6 +4787,7 @@ mod tests {
                 start: 3,
                 end: 4,
                 color: FieldColor::Cyan,
+                background: None,
             },
         ];
         app.selection = Some(Selection {
@@ -4838,6 +4942,51 @@ mod tests {
         let varied = entropy::calculate(&(0..=255).cycle().take(1024).collect::<Vec<_>>());
         assert_eq!(uniform[0], 0.0);
         assert!(varied[0] > 7.9);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn running_inspector_plugins_manually_caches_the_result() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = temporary_file("inspector-plugins");
+        fs::create_dir_all(&directory).unwrap();
+        let script_path = directory.join("sum.sh");
+        fs::write(
+            &script_path,
+            "#!/bin/sh\nod -An -tu1 -v | tr -s ' \\n' '+' | sed 's/^+//; s/+$//' | tr -d '\\n'; echo\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script_path, permissions).unwrap();
+
+        let mut app = App::new("sample.bin".into(), vec![1, 2, 3]);
+        app.inspector_plugins = inspector_plugins::discover(&directory);
+        assert_eq!(app.inspector_plugins.len(), 1);
+        app.selection = Some(Selection {
+            anchor: 0,
+            cursor: 2,
+        });
+
+        // Selecting bytes alone must not run anything.
+        app.poll_inspector_plugins();
+        assert!(app.inspector_plugin_results.is_empty());
+
+        app.run_inspector_plugins();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut value = None;
+        while std::time::Instant::now() < deadline {
+            app.poll_inspector_plugins();
+            if let Some(found) = app.inspector_plugin_results.get("sum") {
+                value = Some(found.clone());
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(value, Some("1+2+3".to_string()));
+
+        let _ = fs::remove_dir_all(&directory);
     }
 
     #[test]
@@ -5040,6 +5189,7 @@ mod tests {
                 start: index,
                 end: index,
                 color: FieldColor::Cyan,
+                background: None,
             })
             .collect();
         app.fields_area = Rect::new(0, 0, 42, 8);
@@ -5315,6 +5465,7 @@ mod tests {
             start: 0,
             end: 1,
             color: FieldColor::Cyan,
+            background: Some(FieldColor::LightBlue),
         });
 
         app.save_overlay_to(&overlay_path).unwrap();
@@ -5323,8 +5474,26 @@ mod tests {
         app.save_binary_to(&binary_path).unwrap();
 
         assert_eq!(app.fields[0].name, "magic");
+        assert_eq!(app.fields[0].background, Some(FieldColor::LightBlue));
         assert_eq!(fs::read(&binary_path).unwrap(), vec![0xCA, 0xFE]);
         fs::remove_file(overlay_path).unwrap();
         fs::remove_file(binary_path).unwrap();
+    }
+
+    #[test]
+    fn loading_an_overlay_saved_before_backgrounds_existed_defaults_to_none() {
+        let overlay_path = temporary_file("legacy-overlay.json");
+        fs::write(
+            &overlay_path,
+            r#"{"fields":[{"name":"magic","description":"","start":0,"end":1,"color":"Cyan"}]}"#,
+        )
+        .unwrap();
+
+        let mut app = App::new("sample.bin".into(), vec![0xCA, 0xFE]);
+        app.load_overlay_from(&overlay_path).unwrap();
+
+        assert_eq!(app.fields[0].name, "magic");
+        assert_eq!(app.fields[0].background, None);
+        fs::remove_file(overlay_path).unwrap();
     }
 }
