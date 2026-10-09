@@ -20,7 +20,11 @@ use crate::app::{
 // both viewer borders so the sidebar border never overwrites the final ASCII
 // character when the terminal is narrowed.
 const VIEWER_MIN_WIDTH: u16 = 79;
-const SIDEBAR_WIDTH: u16 = 41;
+// Wide enough for a marker, a space, a full 32-character field name, a space,
+// an 8-digit offset range ("########-########"), and both borders. Shrinks
+// below this when the terminal is too narrow to fit the viewer as well.
+const SIDEBAR_WIDTH: u16 = 54;
+const MAX_FIELD_NAME_WIDTH: usize = 32;
 
 pub fn render_workspace(frame: &mut Frame, workspace: &mut Workspace) {
     let [tabs, content] =
@@ -636,6 +640,13 @@ fn byte_style(app: &App, offset: usize, byte: u8, ascii: bool) -> Style {
 fn render_fields(frame: &mut Frame, app: &App, area: Rect) {
     let mut lines = Vec::new();
     let list_height = app.visible_fields;
+    // "########-########" is 17 characters; the marker and its two
+    // neighboring spaces add 3 more.
+    const LINE_OVERHEAD: usize = 3 + 17;
+    let name_width = (area.width as usize)
+        .saturating_sub(2) // borders
+        .saturating_sub(LINE_OVERHEAD)
+        .min(MAX_FIELD_NAME_WIDTH);
     for (index, field) in app
         .fields
         .iter()
@@ -655,10 +666,10 @@ fn render_fields(frame: &mut Frame, app: &App, area: Rect) {
         };
         lines.push(Line::from(Span::styled(
             format!(
-                "{marker} {:<16} {:08X}-{:08X}",
-                truncate(&field.name, 16),
+                "{marker} {name:<name_width$} {:08X}-{:08X}",
                 field.start,
-                field.end
+                field.end,
+                name = truncate(&field.name, name_width),
             ),
             style,
         )));
@@ -756,7 +767,16 @@ fn inspector_lines(app: &App) -> Vec<Line<'static>> {
         .collect::<Vec<_>>()
         .join(" ");
 
-    let mut lines = vec![
+    let mut lines = Vec::new();
+    if let Some(field) = app.fields.get(app.selected_field) {
+        lines.push(kv("Field", field.name.clone()));
+        lines.push(Line::from(vec![
+            Span::styled("Description: ", Style::default().fg(Color::DarkGray)),
+            Span::raw(field.description.clone()),
+        ]));
+        lines.push(Line::from(""));
+    }
+    lines.extend([
         kv(
             "Range",
             format!(
@@ -771,7 +791,7 @@ fn inspector_lines(app: &App) -> Vec<Line<'static>> {
         kv("Selected", format!("0x{hex} ({decimal})")),
         kv("ASCII", ascii),
         kv("Binary", binary),
-    ];
+    ]);
     if let Some(byte) = bytes.first() {
         lines.push(kv("u8 / i8", format!("{byte} / {}", *byte as i8)));
     }
@@ -1843,10 +1863,19 @@ mod tests {
 
     #[test]
     fn sidebar_leaves_room_for_ascii_and_ends_with_the_viewer() {
-        let (viewer, sidebar) = split_viewer_and_sidebar(Rect::new(0, 0, 120, 36));
+        let (viewer, sidebar) =
+            split_viewer_and_sidebar(Rect::new(0, 0, VIEWER_MIN_WIDTH + SIDEBAR_WIDTH, 36));
         assert_eq!(viewer.width, VIEWER_MIN_WIDTH);
         assert_eq!(sidebar.width, SIDEBAR_WIDTH);
         assert_eq!(viewer.bottom(), sidebar.bottom());
+    }
+
+    #[test]
+    fn sidebar_shrinks_below_its_preferred_width_on_a_narrow_terminal() {
+        let (viewer, sidebar) = split_viewer_and_sidebar(Rect::new(0, 0, 120, 36));
+        assert_eq!(viewer.width, VIEWER_MIN_WIDTH);
+        assert_eq!(sidebar.width, 120 - VIEWER_MIN_WIDTH);
+        assert!(sidebar.width < SIDEBAR_WIDTH);
     }
 
     #[test]
@@ -1920,6 +1949,97 @@ mod tests {
             .join("\n");
         assert!(rendered.contains("0x1 to 0x2 (1 to 2)"));
         assert!(rendered.contains("0xDE AD (222, 173)"));
+    }
+
+    #[test]
+    fn inspector_shows_the_highlighted_fields_full_name_and_description() {
+        let mut app = App::new(PathBuf::from("sample.bin"), vec![0, 0xDE, 0xAD]);
+        app.selection = Some(crate::model::Selection {
+            anchor: 1,
+            cursor: 2,
+        });
+        app.fields.push(crate::model::Field {
+            name: "a very long field name past sixteen chars".into(),
+            description: "a fairly detailed description of what this field means".into(),
+            start: 1,
+            end: 2,
+            color: crate::model::FieldColor::Cyan,
+        });
+        app.selected_field = 0;
+        let rendered = inspector_lines(&app)
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("a very long field name past sixteen chars"));
+        assert!(rendered.contains("a fairly detailed description of what this field means"));
+    }
+
+    #[test]
+    fn field_pane_shows_the_full_name_when_width_allows() {
+        let backend = TestBackend::new(SIDEBAR_WIDTH, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new(PathBuf::from("sample.bin"), vec![0, 1, 2]);
+        app.fields.push(crate::model::Field {
+            name: "exactly thirty two characters!!!".into(),
+            description: String::new(),
+            start: 0,
+            end: 1,
+            color: crate::model::FieldColor::Cyan,
+        });
+        assert_eq!(app.fields[0].name.chars().count(), MAX_FIELD_NAME_WIDTH);
+        app.visible_fields = 5;
+        let area = Rect::new(0, 0, SIDEBAR_WIDTH, 20);
+        terminal
+            .draw(|frame| render_fields(frame, &app, area))
+            .unwrap();
+        let rendered =
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .fold(String::new(), |mut output, cell| {
+                    output.push_str(cell.symbol());
+                    output
+                });
+        assert!(rendered.contains("exactly thirty two characters!!!"));
+        assert!(!rendered.contains('…'));
+    }
+
+    #[test]
+    fn field_pane_truncates_the_name_on_a_narrow_pane() {
+        let backend = TestBackend::new(30, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new(PathBuf::from("sample.bin"), vec![0, 1, 2]);
+        app.fields.push(crate::model::Field {
+            name: "exactly thirty two characters!!!".into(),
+            description: String::new(),
+            start: 0,
+            end: 1,
+            color: crate::model::FieldColor::Cyan,
+        });
+        app.visible_fields = 5;
+        let area = Rect::new(0, 0, 30, 20);
+        terminal
+            .draw(|frame| render_fields(frame, &app, area))
+            .unwrap();
+        let rendered =
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .fold(String::new(), |mut output, cell| {
+                    output.push_str(cell.symbol());
+                    output
+                });
+        assert!(!rendered.contains("exactly thirty two characters!!!"));
     }
 
     #[test]
