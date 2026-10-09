@@ -2,12 +2,15 @@
 //!
 //! Dropping an executable script into the plugin directory (see
 //! [`default_directory`]) adds one more row to the Inspector pane, without
-//! recompiling rexedit. Each time the byte selection changes, every
-//! discovered plugin is run on a background thread with the selected bytes
-//! (capped at [`MAX_INPUT_BYTES`]) written to its stdin; the first line of
-//! its stdout becomes the row's value. A plugin that exits non-zero, times
-//! out, or prints nothing shows [`ERROR_PLACEHOLDER`] instead of being
-//! silently dropped, so a broken script is visible rather than missing.
+//! recompiling rexedit. Plugins only run when the user presses `r`
+//! (`App::run_inspector_plugins`), never automatically on a selection
+//! change — even a handful of slow (e.g. Python-based) scripts firing on
+//! every mouse drag or held arrow key adds up. On `r`, every discovered
+//! plugin runs on a background thread with the selected bytes (capped at
+//! [`MAX_INPUT_BYTES`]) written to its stdin; the first line of its stdout
+//! becomes the row's value. A plugin that exits non-zero, times out, or
+//! prints nothing shows [`ERROR_PLACEHOLDER`] instead of being silently
+//! dropped, so a broken script is visible rather than missing.
 //!
 //! To turn the feature off, delete the scripts (or the whole directory);
 //! nothing else about rexedit depends on it.
@@ -35,9 +38,12 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_millis(1500);
 
 /// Shown in place of a plugin's value when it fails in any way.
 pub const ERROR_PLACEHOLDER: &str = "(error)";
-/// Shown while a plugin's first result for the current selection is still
-/// running.
+/// Shown for a plugin that's part of a run still in progress but hasn't
+/// reported back yet.
 pub const PENDING_PLACEHOLDER: &str = "(running…)";
+/// Shown for a plugin that has never been run this session (plugins only
+/// run when the user asks, via `r`).
+pub const NOT_RUN_PLACEHOLDER: &str = "(press r to run)";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Plugin {

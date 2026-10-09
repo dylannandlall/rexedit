@@ -488,7 +488,6 @@ pub struct App {
     pub inspector_plugins: Vec<InspectorPlugin>,
     pub inspector_plugin_results: HashMap<String, String>,
     inspector_plugin_worker: Option<InspectorPluginWorker>,
-    inspector_plugin_signature: Option<String>,
 }
 
 impl App {
@@ -536,7 +535,6 @@ impl App {
             inspector_plugins: discover_inspector_plugins(),
             inspector_plugin_results: HashMap::new(),
             inspector_plugin_worker: None,
-            inspector_plugin_signature: None,
         };
         if app.path.is_file() {
             match app.restore_automatic_overlay() {
@@ -603,35 +601,46 @@ impl App {
         self.entropy_total = 0;
     }
 
-    /// Re-runs any user-defined inspector plugins (see `inspector_plugins`)
-    /// whose last run no longer matches the current byte selection, and
-    /// folds in whatever results have arrived from earlier runs. Cheap to
-    /// call every tick: the signature check only hashes a bounded prefix of
-    /// the selection.
-    pub fn sync_inspector_plugins(&mut self) {
+    /// Folds in whatever inspector plugin results have arrived since the
+    /// last tick. Cheap to call every tick even when no run is in flight.
+    pub fn poll_inspector_plugins(&mut self) {
         self.drain_inspector_plugin_messages();
+    }
+
+    pub fn inspector_plugins_running(&self) -> bool {
+        self.inspector_plugin_worker.is_some()
+    }
+
+    /// Runs every discovered inspector plugin once against the current byte
+    /// selection. This is manually triggered (bound to `r`) rather than
+    /// running automatically on every selection change, since even a
+    /// handful of slow (e.g. Python-based) scripts firing on every mouse
+    /// drag or held arrow key adds up; see `inspector_plugins`.
+    pub fn run_inspector_plugins(&mut self) {
         if self.inspector_plugins.is_empty() {
+            self.status = "No inspector plugins installed".into();
+            return;
+        }
+        if self.selection.is_none() {
+            self.status = "Select bytes to run inspector plugins".into();
             return;
         }
         let capped = {
             let bytes = self.current_bytes();
             bytes[..bytes.len().min(inspector_plugins::MAX_INPUT_BYTES)].to_vec()
         };
-        let signature = self.selection.map(|_| content_identity(&capped));
-        if signature == self.inspector_plugin_signature {
-            return;
-        }
-        self.inspector_plugin_signature = signature;
         if let Some(worker) = self.inspector_plugin_worker.take() {
             worker.cancel();
         }
-        if self.selection.is_none() {
-            return;
-        }
+        self.inspector_plugin_results.clear();
         self.inspector_plugin_worker = Some(inspector_plugins::spawn(
             self.inspector_plugins.clone(),
             capped,
         ));
+        self.status = format!(
+            "Running {} inspector plugin(s)…",
+            self.inspector_plugins.len()
+        );
     }
 
     fn drain_inspector_plugin_messages(&mut self) {
@@ -751,7 +760,7 @@ impl Workspace {
             for document in &mut self.documents {
                 document.drain_search_messages();
                 document.drain_entropy_messages();
-                document.sync_inspector_plugins();
+                document.poll_inspector_plugins();
                 snapshots.extend(document.drain_python_messages());
             }
             self.update_entropy_status();
@@ -1655,6 +1664,7 @@ impl App {
             }
             KeyCode::Char('n') => self.next_search_result(),
             KeyCode::Char('N') => self.previous_search_result(),
+            KeyCode::Char('r') => self.run_inspector_plugins(),
             KeyCode::Tab => {
                 self.focus = match self.focus {
                     Focus::Viewer => Focus::Fields,
@@ -1764,6 +1774,7 @@ impl App {
             }
             KeyCode::Insert | KeyCode::Char('i') => self.toggle_edit_kind(),
             KeyCode::Backspace | KeyCode::Delete => self.delete_selected_bytes(),
+            KeyCode::Char('r') => self.run_inspector_plugins(),
             KeyCode::Char(character) if character.is_ascii_hexdigit() => {
                 let nibble = character.to_digit(16).expect("checked hex digit") as u8;
                 self.edit_nibble(nibble);
@@ -4917,7 +4928,7 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn selecting_bytes_runs_inspector_plugins_and_caches_the_result() {
+    fn running_inspector_plugins_manually_caches_the_result() {
         use std::os::unix::fs::PermissionsExt;
 
         let directory = temporary_file("inspector-plugins");
@@ -4940,10 +4951,15 @@ mod tests {
             cursor: 2,
         });
 
+        // Selecting bytes alone must not run anything.
+        app.poll_inspector_plugins();
+        assert!(app.inspector_plugin_results.is_empty());
+
+        app.run_inspector_plugins();
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         let mut value = None;
         while std::time::Instant::now() < deadline {
-            app.sync_inspector_plugins();
+            app.poll_inspector_plugins();
             if let Some(found) = app.inspector_plugin_results.get("sum") {
                 value = Some(found.clone());
                 break;

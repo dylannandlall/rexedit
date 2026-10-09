@@ -806,26 +806,33 @@ fn inspector_lines(app: &App) -> Vec<Line<'static>> {
 }
 
 /// Appends one row per user-defined inspector plugin (see
-/// `inspector_plugins`), in discovery order. A plugin's value lags one
-/// background computation behind a brand new selection; see
-/// `App::sync_inspector_plugins`.
+/// `inspector_plugins`), in discovery order. Plugins only run when the user
+/// presses `r` (`App::run_inspector_plugins`); a row shows the last result
+/// from that run until `r` is pressed again.
 fn add_inspector_plugin_lines(lines: &mut Vec<Line<'static>>, app: &App) {
     if app.inspector_plugins.is_empty() {
         return;
     }
     lines.push(Line::from(""));
     lines.push(Line::styled(
-        "Custom",
+        "Custom [r to run]",
         Style::default()
             .fg(Color::DarkGray)
             .add_modifier(Modifier::BOLD),
     ));
+    let running = app.inspector_plugins_running();
     for plugin in &app.inspector_plugins {
         let value = app
             .inspector_plugin_results
             .get(&plugin.name)
             .cloned()
-            .unwrap_or_else(|| inspector_plugins::PENDING_PLACEHOLDER.to_string());
+            .unwrap_or_else(|| {
+                if running {
+                    inspector_plugins::PENDING_PLACEHOLDER.to_string()
+                } else {
+                    inspector_plugins::NOT_RUN_PLACEHOLDER.to_string()
+                }
+            });
         lines.push(kv(&plugin.name, value));
     }
 }
@@ -992,9 +999,9 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
     ]);
     let second = Line::styled(&app.status, Style::default().fg(Color::Cyan));
     let help = if app.edit_mode {
-        "Ctrl+B then Left/Right binary | Insert/i switches overwrite/insert | Del removes selection | Ctrl+U/R undo/redo | Ctrl+S save | Esc View Mode | ? keybinds"
+        "Ctrl+B then Left/Right binary | Insert/i switches overwrite/insert | Del removes selection | Ctrl+U/R undo/redo | Ctrl+S save | r run plugins | Esc View Mode | ? keybinds"
     } else {
-        "Ctrl+B then Left/Right binary, S compare | Ctrl+U/R undo/redo | Ctrl+S save | Ctrl+F search | i edit | ? keybinds"
+        "Ctrl+B then Left/Right binary, S compare | Ctrl+U/R undo/redo | Ctrl+S save | Ctrl+F search | i edit | r run plugins | ? keybinds"
     };
     let third = Line::styled(help, Style::default().fg(Color::DarkGray));
     frame.render_widget(Paragraph::new(vec![first, second, third]), area);
@@ -1695,6 +1702,7 @@ fn keybinding_lines() -> Vec<Line<'static>> {
         binding("s", "open viewer settings"),
         binding("t", "open theme customization"),
         binding("p", "open the Python buffer console"),
+        binding("r", "run inspector plugins against the current selection"),
         Line::from(""),
         section("Byte Edit Mode"),
         binding("0-9, A-F", "overwrite the selected byte, two nibbles"),
@@ -1724,6 +1732,7 @@ fn keybinding_lines() -> Vec<Line<'static>> {
             "undo / redo overwrite, insertion, or deletion",
         ),
         binding("Ctrl+S", "save the edited binary"),
+        binding("r", "run inspector plugins against the current selection"),
         binding("Escape", "return to View Mode"),
         Line::from(""),
         section("Search syntax"),
