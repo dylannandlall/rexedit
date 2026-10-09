@@ -34,7 +34,7 @@ use crate::{
     inspector_plugins::{self, Plugin as InspectorPlugin, PluginWorker as InspectorPluginWorker},
     model::{
         ByteColorMode, DEFAULT_BYTES_PER_ROW, Field, FieldColor, NamedColor, Overlay, SearchMatch,
-        Selection, Theme,
+        Selection, Theme, cycle_field_background,
     },
     python::{PythonDocument, PythonSession, PythonSnapshot},
     search::{self, SearchMessage, SearchWorker},
@@ -230,11 +230,14 @@ pub struct FieldEditor {
     pub start: TextInput,
     pub end: TextInput,
     pub color: FieldColor,
+    pub background: Option<FieldColor>,
     pub active: usize,
     ranges: Vec<Selection>,
 }
 
 impl FieldEditor {
+    const FIELD_COUNT: usize = 6;
+
     fn new() -> Self {
         Self {
             editing: None,
@@ -243,6 +246,7 @@ impl FieldEditor {
             start: TextInput::default(),
             end: TextInput::default(),
             color: FieldColor::default(),
+            background: None,
             active: 0,
             ranges: Vec::new(),
         }
@@ -256,6 +260,7 @@ impl FieldEditor {
             start: TextInput::with_value(format!("0x{:X}", field.start)),
             end: TextInput::with_value(format!("0x{:X}", field.end)),
             color: field.color,
+            background: field.background,
             active: 0,
             ranges: Vec::new(),
         }
@@ -269,6 +274,10 @@ impl FieldEditor {
             3 => Some(&mut self.end),
             _ => None,
         }
+    }
+
+    fn cycle_background(&mut self, forward: bool) {
+        self.background = cycle_field_background(self.background, forward);
     }
 
     fn handle_text_key(&mut self, key: KeyEvent) {
@@ -1883,7 +1892,7 @@ impl App {
             KeyCode::Esc => self.mode = Mode::Normal,
             KeyCode::Tab | KeyCode::Down => {
                 if let Mode::Field(editor) = &mut self.mode {
-                    editor.active = (editor.active + 1) % 5;
+                    editor.active = (editor.active + 1) % FieldEditor::FIELD_COUNT;
                     if let Some(input) = editor.active_text_mut() {
                         input.selected = !input.value.is_empty();
                     }
@@ -1891,28 +1900,31 @@ impl App {
             }
             KeyCode::BackTab | KeyCode::Up => {
                 if let Mode::Field(editor) = &mut self.mode {
-                    editor.active = editor.active.checked_sub(1).unwrap_or(4);
+                    editor.active = editor
+                        .active
+                        .checked_sub(1)
+                        .unwrap_or(FieldEditor::FIELD_COUNT - 1);
                     if let Some(input) = editor.active_text_mut() {
                         input.selected = !input.value.is_empty();
                     }
                 }
             }
             KeyCode::Left => {
-                if let Mode::Field(editor) = &mut self.mode
-                    && editor.active == 4
-                {
-                    editor.color = editor.color.previous();
-                } else if let Mode::Field(editor) = &mut self.mode {
-                    editor.handle_text_key(key);
+                if let Mode::Field(editor) = &mut self.mode {
+                    match editor.active {
+                        4 => editor.color = editor.color.previous(),
+                        5 => editor.cycle_background(false),
+                        _ => editor.handle_text_key(key),
+                    }
                 }
             }
             KeyCode::Right => {
-                if let Mode::Field(editor) = &mut self.mode
-                    && editor.active == 4
-                {
-                    editor.color = editor.color.next();
-                } else if let Mode::Field(editor) = &mut self.mode {
-                    editor.handle_text_key(key);
+                if let Mode::Field(editor) = &mut self.mode {
+                    match editor.active {
+                        4 => editor.color = editor.color.next(),
+                        5 => editor.cycle_background(true),
+                        _ => editor.handle_text_key(key),
+                    }
                 }
             }
             KeyCode::Enter => self.commit_field_editor(),
@@ -3477,6 +3489,7 @@ impl App {
                 start,
                 end,
                 color: editor.color,
+                background: editor.background,
             };
             self.selected_field = index;
             self.status = "Field updated".into();
@@ -3484,6 +3497,7 @@ impl App {
             let ranges = editor.ranges.clone();
             let description = editor.description.value.trim().to_owned();
             let color = editor.color;
+            let background = editor.background;
             let added = ranges.len();
             for (index, range) in ranges.into_iter().enumerate() {
                 self.fields.push(Field {
@@ -3496,6 +3510,7 @@ impl App {
                     start: range.start(),
                     end: range.end(),
                     color,
+                    background,
                 });
             }
             self.selected_field = self.fields.len().saturating_sub(1);
@@ -3507,6 +3522,7 @@ impl App {
                 start,
                 end,
                 color: editor.color,
+                background: editor.background,
             });
             self.selected_field = self.fields.len() - 1;
             self.status = "Field added".into();
@@ -4763,6 +4779,7 @@ mod tests {
                 start: 0,
                 end: 0,
                 color: FieldColor::Cyan,
+                background: None,
             },
             Field {
                 name: "after".into(),
@@ -4770,6 +4787,7 @@ mod tests {
                 start: 3,
                 end: 4,
                 color: FieldColor::Cyan,
+                background: None,
             },
         ];
         app.selection = Some(Selection {
@@ -5171,6 +5189,7 @@ mod tests {
                 start: index,
                 end: index,
                 color: FieldColor::Cyan,
+                background: None,
             })
             .collect();
         app.fields_area = Rect::new(0, 0, 42, 8);
@@ -5446,6 +5465,7 @@ mod tests {
             start: 0,
             end: 1,
             color: FieldColor::Cyan,
+            background: Some(FieldColor::LightBlue),
         });
 
         app.save_overlay_to(&overlay_path).unwrap();
@@ -5454,8 +5474,26 @@ mod tests {
         app.save_binary_to(&binary_path).unwrap();
 
         assert_eq!(app.fields[0].name, "magic");
+        assert_eq!(app.fields[0].background, Some(FieldColor::LightBlue));
         assert_eq!(fs::read(&binary_path).unwrap(), vec![0xCA, 0xFE]);
         fs::remove_file(overlay_path).unwrap();
         fs::remove_file(binary_path).unwrap();
+    }
+
+    #[test]
+    fn loading_an_overlay_saved_before_backgrounds_existed_defaults_to_none() {
+        let overlay_path = temporary_file("legacy-overlay.json");
+        fs::write(
+            &overlay_path,
+            r#"{"fields":[{"name":"magic","description":"","start":0,"end":1,"color":"Cyan"}]}"#,
+        )
+        .unwrap();
+
+        let mut app = App::new("sample.bin".into(), vec![0xCA, 0xFE]);
+        app.load_overlay_from(&overlay_path).unwrap();
+
+        assert_eq!(app.fields[0].name, "magic");
+        assert_eq!(app.fields[0].background, None);
+        fs::remove_file(overlay_path).unwrap();
     }
 }
