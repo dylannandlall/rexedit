@@ -15,6 +15,7 @@ use crate::app::{
     PATH_SUGGESTION_PAGE_SIZE, PathAction, PathDialog, PythonPane, ResetTarget, SettingsEditor,
     ThemeEditor, Workspace,
 };
+use crate::inspector_plugins;
 
 // A 16-byte row with offsets and ASCII needs 77 inner columns. Leave room for
 // both viewer borders so the sidebar border never overwrites the final ASCII
@@ -800,7 +801,33 @@ fn inspector_lines(app: &App) -> Vec<Line<'static>> {
     if !bytes.is_empty() {
         lines.push(kv("UTF-8", utf8_preview(bytes)));
     }
+    add_inspector_plugin_lines(&mut lines, app);
     lines
+}
+
+/// Appends one row per user-defined inspector plugin (see
+/// `inspector_plugins`), in discovery order. A plugin's value lags one
+/// background computation behind a brand new selection; see
+/// `App::sync_inspector_plugins`.
+fn add_inspector_plugin_lines(lines: &mut Vec<Line<'static>>, app: &App) {
+    if app.inspector_plugins.is_empty() {
+        return;
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::styled(
+        "Custom",
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    ));
+    for plugin in &app.inspector_plugins {
+        let value = app
+            .inspector_plugin_results
+            .get(&plugin.name)
+            .cloned()
+            .unwrap_or_else(|| inspector_plugins::PENDING_PLACEHOLDER.to_string());
+        lines.push(kv(&plugin.name, value));
+    }
 }
 
 fn add_integer_lines(lines: &mut Vec<Line<'static>>, bytes: &[u8]) {

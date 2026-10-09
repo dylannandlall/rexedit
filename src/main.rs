@@ -1,5 +1,6 @@
 mod app;
 mod entropy;
+mod inspector_plugins;
 mod model;
 mod python;
 mod search;
