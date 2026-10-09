@@ -25,6 +25,7 @@ side-by-side diffs, customizable themes, and entropy visualization.
 - Persistent Python analysis console with a mutable byte-buffer snapshot
 - Position-aware vertical scrollbars for the hex viewer and Python console
 - Clickable and draggable scrollbars plus Python command history
+- User-defined inspector plugins: external scripts, run on demand, that compute custom values from the current byte selection
 
 ## Requirements
 
@@ -216,6 +217,7 @@ aligned.
 | `Ctrl+O` / `Ctrl+L` | Save or load an overlay |
 | `o` | Toggle field overlays |
 | `p` | Open the Python buffer console |
+| `r` | Run inspector plugins against the current selection |
 | `s` | Open viewer settings |
 | `t` | Open theme customization |
 | `Ctrl+Z` | Suspend on Unix; resume with the shell built-in `fg` |
@@ -232,6 +234,7 @@ aligned.
 | `Ctrl+V` / `Ctrl+Shift+V` (`Cmd+V` on macOS) | Paste hexadecimal from the system clipboard at the cursor |
 | `Ctrl+U` / `Ctrl+R` | Undo or redo a byte overwrite |
 | `Ctrl+S` | Save the edited binary |
+| `r` | Run inspector plugins against the current selection |
 | Escape | Return to View Mode |
 
 `i` toggles Overwrite/Insert Mode the same as the `Insert` key, for keyboards
@@ -296,6 +299,63 @@ paths. The suggested filename is:
 ```text
 <binary-name>.rexedit-overlay.json
 ```
+
+## Custom inspector plugins
+
+The inspector pane can show your own computed values alongside the built-in
+ones, without recompiling rexedit. Drop an executable script into:
+
+| Platform | Directory |
+| --- | --- |
+| Linux/BSD | `$XDG_DATA_HOME/rexedit/inspectors` (or `~/.local/share/rexedit/inspectors`) |
+| macOS | `~/Library/Application Support/rexedit/inspectors` |
+| Windows | `%APPDATA%\rexedit\inspectors` |
+
+rexedit creates this directory on startup and scans it once at launch, so a
+new or removed script takes effect on the next restart. Each executable file
+becomes one inspector row, labeled after its file name with the extension
+removed (`Varint.py` becomes `Varint`).
+
+A plugin receives the currently selected bytes (up to 4096 of them) on
+stdin and prints its result as the first line of stdout. For example, a
+script that decodes a LEB128/varint-style selection:
+
+```python
+#!/usr/bin/env python3
+import sys
+data = sys.stdin.buffer.read()
+value = 0
+for i, byte in enumerate(data):
+    value |= (byte & 0x7F) << (7 * i)
+    if not (byte & 0x80):
+        print(value)
+        break
+else:
+    print("incomplete")
+```
+
+Make it executable (`chmod +x` on Linux/macOS) and it appears as a "Varint"
+row. A plugin can be written in anything executable: a shell script, a
+Python script with a shebang, a compiled binary, or (on Windows) a `.exe`,
+`.bat`/`.cmd`, or `.ps1`. Windows looks only at those four extensions; Unix
+looks at the executable permission bit.
+
+Plugins run only when you press `r`, in both View and Byte Edit mode —
+never automatically on a selection change. Each row shows the result from
+the last time `r` was pressed, `(press r to run)` if it never has been,
+or `(running…)` while a fresh run is still in flight. This is deliberate:
+even a handful of slow (e.g. Python-based) scripts firing on every mouse
+drag or held arrow key would add noticeable background load for no
+benefit if nothing is watching the result yet.
+
+If a plugin exits non-zero, prints nothing, or takes longer than about 1.5
+seconds, its row shows `(error)` instead of a stale or missing value, so a
+broken script is visible rather than silently dropped. Plugins run on a
+background thread, so a slow or hung script never blocks the UI — you can
+keep editing and moving the selection while a run is in progress.
+
+To turn this off, delete the scripts (or the whole `inspectors` directory);
+nothing else in rexedit depends on it.
 
 ## Themes and settings
 

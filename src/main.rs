@@ -1,5 +1,6 @@
 mod app;
 mod entropy;
+mod inspector_plugins;
 mod model;
 mod python;
 mod search;
@@ -87,6 +88,7 @@ Byte Edit Mode:
 
 Both modes:
   arrows            navigate bytes
+  r                 run inspector plugins against the current selection
   ?                 show the full keybinding reference
   q                 quit"
     );
