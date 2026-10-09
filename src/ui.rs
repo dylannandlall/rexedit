@@ -11,7 +11,7 @@ use ratatui::{
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::app::{
-    App, DisplayRow, FieldEditor, Focus, HelpViewer, Mode, OpenFileDialog,
+    App, DisplayRow, EditKind, FieldEditor, Focus, HelpViewer, Mode, OpenFileDialog,
     PATH_SUGGESTION_PAGE_SIZE, PathAction, PathDialog, PythonPane, ResetTarget, SettingsEditor,
     ThemeEditor, Workspace,
 };
@@ -920,10 +920,15 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
             app.search.results.len()
         )
     };
-    let mode = if app.edit_mode {
-        format!(" | {} Mode", app.edit_kind.name())
+    let mode_span = if app.edit_mode {
+        Span::styled(
+            format!(" | {} Mode", app.edit_kind.name()),
+            Style::default()
+                .fg(edit_kind_color(app.edit_kind))
+                .add_modifier(Modifier::BOLD),
+        )
     } else {
-        " | View Mode".into()
+        Span::raw(" | View Mode")
     };
     let first = Line::from(vec![
         Span::styled(
@@ -931,11 +936,12 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().add_modifier(Modifier::BOLD),
         ),
         Span::raw(format!(
-            "| {} bytes | {} fields | {}{dirty}{search}{mode}",
+            "| {} bytes | {} fields | {}{dirty}{search}",
             app.bytes.len(),
             app.fields.len(),
             selection_location_summary(app),
         )),
+        mode_span,
     ]);
     let second = Line::styled(&app.status, Style::default().fg(Color::Cyan));
     let help = if app.edit_mode {
@@ -1763,7 +1769,7 @@ fn title_style(app: &App, active: bool) -> Style {
 fn viewer_title_style(app: &App) -> Style {
     if app.edit_mode {
         Style::default()
-            .fg(Color::LightRed)
+            .fg(edit_kind_color(app.edit_kind))
             .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
     } else {
         title_style(app, app.focus == Focus::Viewer)
@@ -1772,9 +1778,18 @@ fn viewer_title_style(app: &App) -> Style {
 
 fn viewer_border_style(app: &App) -> Style {
     if app.edit_mode {
-        Style::default().fg(Color::LightRed)
+        Style::default().fg(edit_kind_color(app.edit_kind))
     } else {
         border_style(app, app.focus == Focus::Viewer)
+    }
+}
+
+/// Overwrite Mode stays red; Insert Mode is orange so the two are
+/// distinguishable at a glance while editing binaries.
+fn edit_kind_color(edit_kind: EditKind) -> Color {
+    match edit_kind {
+        EditKind::Overwrite => Color::LightRed,
+        EditKind::Insert => Color::Rgb(255, 165, 0),
     }
 }
 
