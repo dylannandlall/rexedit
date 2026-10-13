@@ -3166,6 +3166,7 @@ impl App {
         self.search.results.clear();
         Arc::make_mut(&mut self.bytes).splice(offset..offset, bytes_to_insert.iter().copied());
         self.shift_fields_for_insert(offset, bytes_to_insert.len());
+        self.sort_fields();
         self.invalidate_entropy();
         self.rebuild_display_rows();
         self.refresh_modified_offsets();
@@ -3182,10 +3183,31 @@ impl App {
             .drain(offset..end)
             .collect::<Vec<_>>();
         self.shift_fields_for_delete(offset, removed.len());
+        self.sort_fields();
         self.invalidate_entropy();
         self.rebuild_display_rows();
         self.refresh_modified_offsets();
         removed
+    }
+
+    /// Keeps `fields` ordered by start offset, then name, so the field pane
+    /// reads top-to-bottom in file order. The selected field stays selected.
+    fn sort_fields(&mut self) {
+        if self
+            .fields
+            .is_sorted_by(|a, b| field_order(a, b) != std::cmp::Ordering::Greater)
+        {
+            return;
+        }
+        let selected = self.fields.get(self.selected_field).cloned();
+        self.fields.sort_by(field_order);
+        if let Some(selected) = selected
+            && let Some(index) = self.fields.iter().position(|field| *field == selected)
+            && index != self.selected_field
+        {
+            self.selected_field = index;
+            self.ensure_selected_field_visible();
+        }
     }
 
     fn shift_fields_for_insert(&mut self, offset: usize, length: usize) {
@@ -3527,6 +3549,7 @@ impl App {
             self.selected_field = self.fields.len() - 1;
             self.status = "Field added".into();
         }
+        self.sort_fields();
         self.mode = Mode::Normal;
         self.activate_selected_field();
         self.save_automatic_overlay_after_change();
@@ -3784,7 +3807,9 @@ impl App {
             .fields
             .retain(|field| field.start <= field.end && field.end < self.bytes.len());
         self.fields = overlay.fields;
+        self.sort_fields();
         self.selected_field = 0;
+        self.fields_scroll = 0;
         Ok(format!(
             "Loaded {} fields from {}",
             self.fields.len(),
@@ -4076,6 +4101,15 @@ fn completion_display_path(path: &Path) -> String {
         display.push(std::path::MAIN_SEPARATOR);
     }
     display
+}
+
+/// Field pane order: start offset ascending, then name ascending
+/// (case-insensitive, with an exact comparison as a deterministic tiebreak).
+fn field_order(a: &Field, b: &Field) -> std::cmp::Ordering {
+    a.start
+        .cmp(&b.start)
+        .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        .then_with(|| a.name.cmp(&b.name))
 }
 
 fn hex_string(bytes: &[u8]) -> String {
@@ -4464,6 +4498,99 @@ mod tests {
 
         assert_eq!(app.fields[0].name, "field_1");
         assert_eq!((app.fields[0].start, app.fields[0].end), (3, 8));
+    }
+
+    fn add_field_via_editor(app: &mut App, name: &str, start: usize, end: usize) {
+        let mut editor = FieldEditor::new();
+        editor.name = TextInput::with_value(name.into());
+        editor.start = TextInput::with_value(start.to_string());
+        editor.end = TextInput::with_value(end.to_string());
+        app.mode = Mode::Field(editor);
+        app.commit_field_editor();
+    }
+
+    fn field_summary(app: &App) -> Vec<(usize, &str)> {
+        app.fields
+            .iter()
+            .map(|field| (field.start, field.name.as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn fields_stay_sorted_by_start_then_name_and_keep_the_new_field_selected() {
+        let mut app = App::new("sample.bin".into(), vec![0; 64]);
+        add_field_via_editor(&mut app, "trailer", 40, 47);
+        add_field_via_editor(&mut app, "header", 0, 3);
+        add_field_via_editor(&mut app, "magic", 8, 11);
+        add_field_via_editor(&mut app, "Beta", 8, 9);
+        add_field_via_editor(&mut app, "alpha", 8, 8);
+
+        assert_eq!(
+            field_summary(&app),
+            vec![
+                (0, "header"),
+                (8, "alpha"),
+                (8, "Beta"),
+                (8, "magic"),
+                (40, "trailer"),
+            ]
+        );
+        assert_eq!(app.fields[app.selected_field].name, "alpha");
+    }
+
+    #[test]
+    fn editing_a_fields_start_moves_it_and_keeps_it_selected() {
+        let mut app = App::new("sample.bin".into(), vec![0; 64]);
+        add_field_via_editor(&mut app, "a", 0, 1);
+        add_field_via_editor(&mut app, "b", 10, 11);
+        add_field_via_editor(&mut app, "c", 20, 21);
+
+        app.selected_field = 0;
+        let mut editor = FieldEditor::from_field(0, &app.fields[0]);
+        editor.start = TextInput::with_value("30".into());
+        editor.end = TextInput::with_value("31".into());
+        app.mode = Mode::Field(editor);
+        app.commit_field_editor();
+
+        assert_eq!(field_summary(&app), vec![(10, "b"), (20, "c"), (30, "a")]);
+        assert_eq!(app.fields[app.selected_field].name, "a");
+    }
+
+    #[test]
+    fn loading_an_unsorted_overlay_sorts_it_and_selects_the_first_field() {
+        let overlay_path = temporary_file("unsorted-overlay.json");
+        fs::write(
+            &overlay_path,
+            r#"{"fields":[
+                {"name":"late","start":6,"end":7,"color":"Cyan"},
+                {"name":"zeta","start":2,"end":3,"color":"Cyan"},
+                {"name":"Alpha","start":2,"end":2,"color":"Cyan"},
+                {"name":"first","start":0,"end":1,"color":"Cyan"}
+            ]}"#,
+        )
+        .unwrap();
+        let mut app = App::new("sample.bin".into(), vec![0; 8]);
+        app.load_overlay_from(&overlay_path).unwrap();
+
+        assert_eq!(
+            field_summary(&app),
+            vec![(0, "first"), (2, "Alpha"), (2, "zeta"), (6, "late")]
+        );
+        assert_eq!(app.selected_field, 0);
+        fs::remove_file(overlay_path).unwrap();
+    }
+
+    #[test]
+    fn deleting_bytes_that_collapse_two_starts_together_resorts_by_name() {
+        let mut app = App::new("sample.bin".into(), vec![0; 16]);
+        add_field_via_editor(&mut app, "zulu", 5, 10);
+        add_field_via_editor(&mut app, "alpha", 8, 11);
+        assert_eq!(field_summary(&app), vec![(5, "zulu"), (8, "alpha")]);
+
+        // Removing bytes 5..=8 pulls both fields' starts back to offset 5.
+        app.delete_bytes_at(5, 4);
+
+        assert_eq!(field_summary(&app), vec![(5, "alpha"), (5, "zulu")]);
     }
 
     #[test]

@@ -295,6 +295,11 @@ selections, rexedit creates one identically colored field per range. Fields supp
   the hex and ASCII columns;
 - selection, updating, and deletion.
 
+The field pane lists fields in file order: by start offset, then by name
+(case-insensitive) when two fields start at the same byte. The order is kept
+as fields are added, edited, loaded from an overlay, or shifted by inserting
+and deleting bytes, and the field you were working on stays selected.
+
 The text color/underline and the background always show together — there is
 no setting to show one without the other. Background defaults to "none" (no
 shading, matching rexedit's previous look); in the field editor, Tab to the
