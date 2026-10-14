@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::Arc,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(windows)]
@@ -33,8 +33,8 @@ use crate::{
     entropy::{self, EntropyMessage, EntropyWorker},
     inspector_plugins::{self, Plugin as InspectorPlugin, PluginWorker as InspectorPluginWorker},
     model::{
-        ByteColorMode, DEFAULT_BYTES_PER_ROW, Field, FieldColor, NamedColor, Overlay, SearchMatch,
-        Selection, Theme, cycle_field_background,
+        ByteColorMode, DEFAULT_BYTES_PER_ROW, Field, FieldColor, NamedColor, Overlay,
+        OverlayMetadata, SearchMatch, Selection, Theme, cycle_field_background,
     },
     python::{PythonDocument, PythonSession, PythonSnapshot},
     search::{self, SearchMessage, SearchWorker},
@@ -497,11 +497,23 @@ pub struct App {
     pub inspector_plugins: Vec<InspectorPlugin>,
     pub inspector_plugin_results: HashMap<String, String>,
     inspector_plugin_worker: Option<InspectorPluginWorker>,
+    /// `content_identity(saved_bytes)`, cached because hashing a large
+    /// file is slow and saved_bytes only changes on load and save.
+    saved_content_id: String,
+    overlay_dir: PathBuf,
+    /// The automatic overlay file linked to this binary, once one exists.
+    overlay_path: Option<PathBuf>,
+    overlay_created: Option<String>,
 }
 
 impl App {
     pub fn new(path: PathBuf, bytes: Vec<u8>) -> Self {
+        Self::with_overlay_dir(path, bytes, overlay_storage_dir())
+    }
+
+    fn with_overlay_dir(path: PathBuf, bytes: Vec<u8>, overlay_dir: PathBuf) -> Self {
         let selection = (!bytes.is_empty()).then(|| Selection::new(0));
+        let saved_content_id = content_identity(&bytes);
         let mut app = Self {
             path,
             saved_bytes: Arc::new(bytes.clone()),
@@ -544,13 +556,21 @@ impl App {
             inspector_plugins: discover_inspector_plugins(),
             inspector_plugin_results: HashMap::new(),
             inspector_plugin_worker: None,
+            saved_content_id,
+            overlay_dir,
+            overlay_path: None,
+            overlay_created: None,
         };
         if app.path.is_file() {
             match app.restore_automatic_overlay() {
-                Ok(true) => {
-                    app.status = format!("Restored {} saved overlay field(s)", app.fields.len());
+                Ok(Some(path)) => {
+                    app.status = format!(
+                        "Restored {} saved overlay field(s) from {}",
+                        app.fields.len(),
+                        path.display()
+                    );
                 }
-                Ok(false) => {}
+                Ok(None) => {}
                 Err(error) => app.status = format!("Could not restore saved overlay: {error}"),
             }
         }
@@ -671,38 +691,97 @@ impl App {
         }
     }
 
-    fn automatic_overlay_path(&self) -> PathBuf {
-        overlay_storage_dir().join(format!("{}.json", content_identity(&self.saved_bytes)))
+    fn file_name(&self) -> String {
+        self.path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default()
     }
 
-    fn restore_automatic_overlay(&mut self) -> Result<bool, String> {
-        let path = self.automatic_overlay_path();
-        if !path.is_file() {
-            return Ok(false);
+    /// The linked automatic overlay, or the name a new one would get.
+    fn suggested_overlay_path(&self) -> PathBuf {
+        self.overlay_path
+            .clone()
+            .unwrap_or_else(|| next_free_overlay_path(&self.overlay_dir, &self.file_name()))
+    }
+
+    /// Finds this binary's automatic overlay by the content ID in each
+    /// overlay's metadata, so renaming or moving the binary keeps its
+    /// overlay. A hash-named overlay from before metadata existed is moved
+    /// to a readable name the first time its binary is opened.
+    fn restore_automatic_overlay(&mut self) -> Result<Option<PathBuf>, String> {
+        if let Some((path, overlay)) =
+            find_overlay_for_content(&self.overlay_dir, &self.file_name(), &self.saved_content_id)
+        {
+            self.overlay_created = overlay.metadata.map(|metadata| metadata.created);
+            self.apply_overlay_fields(overlay.fields);
+            self.overlay_path = Some(path.clone());
+            return Ok(Some(path));
         }
-        self.load_overlay_from(&path)?;
-        Ok(true)
+
+        let legacy = self
+            .overlay_dir
+            .join(format!("{}.json", self.saved_content_id));
+        if !legacy.is_file() {
+            return Ok(None);
+        }
+        let overlay = read_overlay(&legacy)?;
+        self.apply_overlay_fields(overlay.fields);
+        match self.persist_automatic_overlay()? {
+            Some(migrated) => {
+                // The fields now live in the readable copy; drop the old name.
+                let _ = fs::remove_file(&legacy);
+                Ok(Some(migrated))
+            }
+            None => Ok(Some(legacy)),
+        }
     }
 
-    fn persist_automatic_overlay(&self) -> Result<Option<PathBuf>, String> {
+    fn persist_automatic_overlay(&mut self) -> Result<Option<PathBuf>, String> {
         if !self.path.is_file() {
             return Ok(None);
         }
-        let path = self.automatic_overlay_path();
-        if self.fields.is_empty() && !path.is_file() {
-            return Ok(None);
+        let (path, newly_allocated) = match &self.overlay_path {
+            Some(path) => (path.clone(), false),
+            None if self.fields.is_empty() => return Ok(None),
+            None => {
+                let path = allocate_overlay_path(&self.overlay_dir, &self.file_name()).map_err(
+                    |error| {
+                        format!(
+                            "Could not create an overlay in {}: {error}",
+                            self.overlay_dir.display()
+                        )
+                    },
+                )?;
+                (path, true)
+            }
+        };
+        self.overlay_created
+            .get_or_insert_with(|| utc_timestamp(SystemTime::now()));
+        if let Err(error) = self.save_overlay_to(&path) {
+            if newly_allocated {
+                let _ = fs::remove_file(&path);
+            }
+            return Err(error);
         }
-        let parent = path
-            .parent()
-            .ok_or_else(|| "Could not determine the overlay storage directory".to_string())?;
-        fs::create_dir_all(parent).map_err(|error| {
-            format!(
-                "Could not create overlay storage directory {}: {error}",
-                parent.display()
-            )
-        })?;
-        self.save_overlay_to(&path)?;
+        self.overlay_path = Some(path.clone());
         Ok(Some(path))
+    }
+
+    fn overlay_metadata(&self) -> OverlayMetadata {
+        let now = utc_timestamp(SystemTime::now());
+        OverlayMetadata {
+            format_version: OVERLAY_FORMAT_VERSION,
+            file_name: self.file_name(),
+            file_path: fs::canonicalize(&self.path)
+                .unwrap_or_else(|_| self.path.clone())
+                .display()
+                .to_string(),
+            file_size: self.saved_bytes.len() as u64,
+            content_id: self.saved_content_id.clone(),
+            created: self.overlay_created.clone().unwrap_or_else(|| now.clone()),
+            updated: now,
+        }
     }
 
     fn save_automatic_overlay_after_change(&mut self) {
@@ -1326,7 +1405,7 @@ impl Workspace {
             return;
         }
         self.active_mut().invalidate_entropy();
-        if let Err(error) = self.active().persist_automatic_overlay() {
+        if let Err(error) = self.active_mut().persist_automatic_overlay() {
             self.status = error;
             return;
         }
@@ -1349,7 +1428,7 @@ impl Workspace {
     }
 
     fn persist_all_automatic_overlays(&mut self) {
-        for document in &self.documents {
+        for document in &mut self.documents {
             if let Err(error) = document.persist_automatic_overlay() {
                 self.status = error;
                 break;
@@ -3742,7 +3821,7 @@ impl App {
 
     fn open_path_dialog(&mut self, action: PathAction) {
         let suggested = match action {
-            PathAction::SaveOverlay | PathAction::LoadOverlay => self.automatic_overlay_path(),
+            PathAction::SaveOverlay | PathAction::LoadOverlay => self.suggested_overlay_path(),
             PathAction::SaveBinary => self.path.clone(),
             PathAction::SaveTheme | PathAction::LoadTheme => suggested_named_path(&format!(
                 "{}.rexedit-theme.json",
@@ -3780,16 +3859,16 @@ impl App {
     }
 
     fn save_overlay_to(&self, path: &Path) -> Result<String, String> {
-        let automatic_dir = overlay_storage_dir();
-        if path.starts_with(&automatic_dir) {
-            fs::create_dir_all(&automatic_dir).map_err(|error| {
+        if path.starts_with(&self.overlay_dir) {
+            fs::create_dir_all(&self.overlay_dir).map_err(|error| {
                 format!(
                     "Could not create overlay storage directory {}: {error}",
-                    automatic_dir.display()
+                    self.overlay_dir.display()
                 )
             })?;
         }
         let json = serde_json::to_string_pretty(&Overlay {
+            metadata: Some(self.overlay_metadata()),
             fields: self.fields.clone(),
         })
         .map_err(|error| format!("Could not serialize overlay: {error}"))?;
@@ -3799,22 +3878,30 @@ impl App {
     }
 
     fn load_overlay_from(&mut self, path: &Path) -> Result<String, String> {
-        let json = fs::read_to_string(path)
-            .map_err(|error| format!("Could not read overlay {}: {error}", path.display()))?;
-        let mut overlay: Overlay = serde_json::from_str(&json)
-            .map_err(|error| format!("Invalid overlay JSON: {error}"))?;
-        overlay
-            .fields
-            .retain(|field| field.start <= field.end && field.end < self.bytes.len());
-        self.fields = overlay.fields;
-        self.sort_fields();
-        self.selected_field = 0;
-        self.fields_scroll = 0;
-        Ok(format!(
+        let overlay = read_overlay(path)?;
+        let made_for_other = overlay
+            .metadata
+            .as_ref()
+            .filter(|metadata| metadata.content_id != self.saved_content_id)
+            .map(|metadata| metadata.file_name.clone());
+        self.apply_overlay_fields(overlay.fields);
+        let mut message = format!(
             "Loaded {} fields from {}",
             self.fields.len(),
             path.display()
-        ))
+        );
+        if let Some(file_name) = made_for_other {
+            message.push_str(&format!(" (made for a different binary: {file_name})"));
+        }
+        Ok(message)
+    }
+
+    fn apply_overlay_fields(&mut self, mut fields: Vec<Field>) {
+        fields.retain(|field| field.start <= field.end && field.end < self.bytes.len());
+        self.fields = fields;
+        self.sort_fields();
+        self.selected_field = 0;
+        self.fields_scroll = 0;
     }
 
     fn save_binary_to(&mut self, path: &Path) -> Result<String, String> {
@@ -3823,6 +3910,8 @@ impl App {
             .map_err(|error| format!("Could not save binary to {}: {error}", path.display()))?;
         self.path = path.to_owned();
         self.saved_bytes = Arc::clone(&self.bytes);
+        // The linked overlay keeps its file; its metadata follows the new content.
+        self.saved_content_id = content_identity(&self.saved_bytes);
         self.modified_offsets.clear();
         self.undo_stack.clear();
         self.redo_stack.clear();
@@ -3884,6 +3973,127 @@ impl App {
 
 fn overlay_storage_dir() -> PathBuf {
     rexedit_data_dir("overlays")
+}
+
+const OVERLAY_FORMAT_VERSION: u32 = 1;
+
+fn read_overlay(path: &Path) -> Result<Overlay, String> {
+    let json = fs::read_to_string(path)
+        .map_err(|error| format!("Could not read overlay {}: {error}", path.display()))?;
+    serde_json::from_str(&json).map_err(|error| format!("Invalid overlay JSON: {error}"))
+}
+
+/// The binary's file name made safe for any filesystem: path separators,
+/// shell-awkward characters, and a leading dot (which would hide the file)
+/// become `_`; letters, digits, `.`, `-` and `_` are kept.
+fn overlay_name_stem(file_name: &str) -> String {
+    let stem: String = file_name
+        .chars()
+        .enumerate()
+        .map(|(index, character)| match character {
+            '.' if index == 0 => '_',
+            character if character.is_alphanumeric() || matches!(character, '.' | '-' | '_') => {
+                character
+            }
+            _ => '_',
+        })
+        .collect();
+    if stem.is_empty() {
+        "binary".into()
+    } else {
+        stem
+    }
+}
+
+fn overlay_file_name(file_name: &str, number: usize) -> String {
+    format!("{}-overlay-{number}.json", overlay_name_stem(file_name))
+}
+
+/// Path for `<file name>-overlay-<n>.json` with the lowest unused `n`,
+/// without creating it.
+fn next_free_overlay_path(dir: &Path, file_name: &str) -> PathBuf {
+    (1..)
+        .map(|number| dir.join(overlay_file_name(file_name, number)))
+        .find(|path| !path.exists())
+        .expect("an unused overlay number exists")
+}
+
+/// Claims `<file name>-overlay-<n>.json` with the lowest unused `n` by
+/// creating it, so two rexedit instances can never pick the same name.
+fn allocate_overlay_path(dir: &Path, file_name: &str) -> io::Result<PathBuf> {
+    fs::create_dir_all(dir)?;
+    let mut number = 1;
+    loop {
+        let path = dir.join(overlay_file_name(file_name, number));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(_) => return Ok(path),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => number += 1,
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// Finds the overlay in `dir` whose metadata records `content_id`.
+/// Overlays named after `file_name` are tried first since that is the usual
+/// match; files without metadata or that fail to parse are skipped.
+fn find_overlay_for_content(
+    dir: &Path,
+    file_name: &str,
+    content_id: &str,
+) -> Option<(PathBuf, Overlay)> {
+    let likely_prefix = format!("{}-overlay-", overlay_name_stem(file_name));
+    let mut candidates = fs::read_dir(dir)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|path| {
+        let likely = path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with(&likely_prefix));
+        (!likely, path.clone())
+    });
+    candidates.into_iter().find_map(|path| {
+        let overlay = read_overlay(&path).ok()?;
+        (overlay.metadata.as_ref()?.content_id == content_id).then_some((path, overlay))
+    })
+}
+
+/// RFC 3339 UTC timestamp, e.g. `2026-10-13T15:04:05Z`.
+fn utc_timestamp(time: SystemTime) -> String {
+    let seconds = time
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    let (days, time_of_day) = (seconds / 86_400, seconds % 86_400);
+    // Days since 1970-01-01 to a civil date (Howard Hinnant's algorithm).
+    let shifted = days as i64 + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let day_of_era = shifted.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_index = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_index + 2) / 5 + 1;
+    let month = if month_index < 10 {
+        month_index + 3
+    } else {
+        month_index - 9
+    };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        time_of_day / 3_600,
+        time_of_day % 3_600 / 60,
+        time_of_day % 60
+    )
 }
 
 fn discover_inspector_plugins() -> Vec<InspectorPlugin> {
@@ -4733,20 +4943,195 @@ mod tests {
         assert!(!app.is_search_match(5));
     }
 
+    /// A fresh, empty directory for a test, removed by the caller.
+    fn temporary_dir(name: &str) -> PathBuf {
+        let directory = temporary_file(name);
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).unwrap();
+        directory
+    }
+
+    fn overlay_json(path: &Path) -> serde_json::Value {
+        serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+    }
+
     #[test]
-    fn automatic_overlay_path_uses_the_user_data_directory_and_content_identity() {
-        let app = App::new("sample.bin".into(), vec![0xCA, 0xFE]);
+    fn overlay_file_names_are_readable_and_filesystem_safe() {
         assert_eq!(
-            app.automatic_overlay_path().parent(),
-            Some(overlay_storage_dir().as_path())
+            overlay_file_name("firmware.bin", 1),
+            "firmware.bin-overlay-1.json"
         );
         assert_eq!(
-            app.automatic_overlay_path()
-                .file_name()
-                .unwrap()
-                .to_string_lossy(),
-            format!("{}.json", content_identity(&[0xCA, 0xFE]))
+            overlay_file_name("my file:v2.bin", 3),
+            "my_file_v2.bin-overlay-3.json"
         );
+        assert_eq!(overlay_file_name(".bashrc", 1), "_bashrc-overlay-1.json");
+        assert_eq!(overlay_file_name("", 1), "binary-overlay-1.json");
+        assert!(!overlay_file_name("../../etc/passwd", 1).contains('/'));
+    }
+
+    #[test]
+    fn allocating_overlay_paths_takes_the_lowest_free_number() {
+        let directory = temporary_dir("overlay-allocation");
+        let first = allocate_overlay_path(&directory, "fw.bin").unwrap();
+        let second = allocate_overlay_path(&directory, "fw.bin").unwrap();
+        let other = allocate_overlay_path(&directory, "other.bin").unwrap();
+        assert_eq!(first, directory.join("fw.bin-overlay-1.json"));
+        assert_eq!(second, directory.join("fw.bin-overlay-2.json"));
+        assert_eq!(other, directory.join("other.bin-overlay-1.json"));
+
+        fs::remove_file(&first).unwrap();
+        assert_eq!(next_free_overlay_path(&directory, "fw.bin"), first);
+        assert_eq!(
+            next_free_overlay_path(&directory, "other.bin"),
+            directory.join("other.bin-overlay-2.json")
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn utc_timestamps_format_known_instants() {
+        let at = |seconds| utc_timestamp(UNIX_EPOCH + Duration::from_secs(seconds));
+        assert_eq!(at(0), "1970-01-01T00:00:00Z");
+        assert_eq!(at(946_684_799), "1999-12-31T23:59:59Z");
+        assert_eq!(at(951_782_400), "2000-02-29T00:00:00Z");
+        assert_eq!(at(1_791_903_845), "2026-10-13T15:04:05Z");
+    }
+
+    #[test]
+    fn field_changes_create_a_named_overlay_with_metadata_that_reopening_restores() {
+        let overlays = temporary_dir("named-overlays");
+        let binary_dir = temporary_dir("named-overlay-binaries");
+        let binary = binary_dir.join("fw.bin");
+        let bytes = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        fs::write(&binary, &bytes).unwrap();
+
+        let mut app = App::with_overlay_dir(binary.clone(), bytes.clone(), overlays.clone());
+        add_field_via_editor(&mut app, "magic", 0, 3);
+
+        let overlay = overlays.join("fw.bin-overlay-1.json");
+        let json = overlay_json(&overlay);
+        let metadata = &json["metadata"];
+        assert_eq!(metadata["format_version"], 1);
+        assert_eq!(metadata["file_name"], "fw.bin");
+        assert_eq!(metadata["file_size"], 4);
+        assert_eq!(metadata["content_id"], content_identity(&bytes));
+        assert!(metadata["file_path"].as_str().unwrap().ends_with("fw.bin"));
+        assert!(metadata["created"].as_str().unwrap().ends_with('Z'));
+        assert_eq!(json["fields"][0]["name"], "magic");
+
+        let reopened = App::with_overlay_dir(binary.clone(), bytes.clone(), overlays.clone());
+        assert_eq!(reopened.fields[0].name, "magic");
+        assert_eq!(reopened.overlay_path, Some(overlay.clone()));
+
+        // A renamed copy with the same bytes still finds its overlay.
+        let renamed = binary_dir.join("renamed.bin");
+        fs::write(&renamed, &bytes).unwrap();
+        let moved = App::with_overlay_dir(renamed, bytes, overlays.clone());
+        assert_eq!(moved.fields[0].name, "magic");
+        assert_eq!(moved.overlay_path, Some(overlay));
+
+        fs::remove_dir_all(overlays).unwrap();
+        fs::remove_dir_all(binary_dir).unwrap();
+    }
+
+    #[test]
+    fn different_binaries_with_the_same_name_get_numbered_overlays() {
+        let overlays = temporary_dir("numbered-overlays");
+        let first_dir = temporary_dir("numbered-first");
+        let second_dir = temporary_dir("numbered-second");
+        let (first, second) = (first_dir.join("fw.bin"), second_dir.join("fw.bin"));
+        fs::write(&first, [1, 1]).unwrap();
+        fs::write(&second, [2, 2]).unwrap();
+
+        let mut app = App::with_overlay_dir(first.clone(), vec![1, 1], overlays.clone());
+        add_field_via_editor(&mut app, "from_first", 0, 1);
+        let mut app = App::with_overlay_dir(second.clone(), vec![2, 2], overlays.clone());
+        add_field_via_editor(&mut app, "from_second", 0, 1);
+
+        assert!(overlays.join("fw.bin-overlay-1.json").is_file());
+        assert!(overlays.join("fw.bin-overlay-2.json").is_file());
+        let reopened = App::with_overlay_dir(first, vec![1, 1], overlays.clone());
+        assert_eq!(reopened.fields[0].name, "from_first");
+        let reopened = App::with_overlay_dir(second, vec![2, 2], overlays.clone());
+        assert_eq!(reopened.fields[0].name, "from_second");
+
+        fs::remove_dir_all(overlays).unwrap();
+        fs::remove_dir_all(first_dir).unwrap();
+        fs::remove_dir_all(second_dir).unwrap();
+    }
+
+    #[test]
+    fn saving_edited_bytes_updates_the_same_overlay_instead_of_orphaning_it() {
+        let overlays = temporary_dir("save-overlays");
+        let binary_dir = temporary_dir("save-binaries");
+        let binary = binary_dir.join("fw.bin");
+        fs::write(&binary, [0xAA, 0xBB]).unwrap();
+
+        let mut app = App::with_overlay_dir(binary.clone(), vec![0xAA, 0xBB], overlays.clone());
+        add_field_via_editor(&mut app, "kept", 0, 1);
+        app.selection = Some(Selection::new(0));
+        app.overwrite_nibble(0x1);
+        app.overwrite_nibble(0x2);
+        app.save_binary_to(&binary).unwrap();
+
+        let overlay = overlays.join("fw.bin-overlay-1.json");
+        assert_eq!(
+            overlay_json(&overlay)["metadata"]["content_id"],
+            content_identity(&[0x12, 0xBB])
+        );
+        assert!(!overlays.join("fw.bin-overlay-2.json").exists());
+        let reopened = App::with_overlay_dir(binary, vec![0x12, 0xBB], overlays.clone());
+        assert_eq!(reopened.fields[0].name, "kept");
+
+        fs::remove_dir_all(overlays).unwrap();
+        fs::remove_dir_all(binary_dir).unwrap();
+    }
+
+    #[test]
+    fn hash_named_overlays_are_renamed_with_metadata_when_their_binary_opens() {
+        let overlays = temporary_dir("legacy-overlays");
+        let binary_dir = temporary_dir("legacy-binaries");
+        let binary = binary_dir.join("fw.bin");
+        let bytes = vec![0xCA, 0xFE];
+        fs::write(&binary, &bytes).unwrap();
+        let legacy = overlays.join(format!("{}.json", content_identity(&bytes)));
+        fs::write(
+            &legacy,
+            r#"{"fields":[{"name":"old","start":0,"end":1,"color":"Cyan"}]}"#,
+        )
+        .unwrap();
+
+        let app = App::with_overlay_dir(binary, bytes.clone(), overlays.clone());
+
+        assert_eq!(app.fields[0].name, "old");
+        assert!(!legacy.exists());
+        let migrated = overlays.join("fw.bin-overlay-1.json");
+        assert_eq!(app.overlay_path, Some(migrated.clone()));
+        assert_eq!(
+            overlay_json(&migrated)["metadata"]["content_id"],
+            content_identity(&bytes)
+        );
+
+        fs::remove_dir_all(overlays).unwrap();
+        fs::remove_dir_all(binary_dir).unwrap();
+    }
+
+    #[test]
+    fn loading_an_overlay_made_for_another_binary_says_so() {
+        let overlays = temporary_dir("foreign-overlays");
+        let foreign = overlays.join("other.bin-overlay-1.json");
+        fs::write(
+            &foreign,
+            r#"{"metadata":{"file_name":"other.bin","content_id":"not-this-one"},"fields":[]}"#,
+        )
+        .unwrap();
+
+        let mut app = App::with_overlay_dir("sample.bin".into(), vec![0; 4], overlays.clone());
+        let message = app.load_overlay_from(&foreign).unwrap();
+
+        assert!(message.contains("made for a different binary: other.bin"));
+        fs::remove_dir_all(overlays).unwrap();
     }
 
     #[test]
@@ -5585,7 +5970,9 @@ mod tests {
     fn overlay_and_binary_paths_round_trip() {
         let overlay_path = temporary_file("overlay.json");
         let binary_path = temporary_file("saved.bin");
-        let mut app = App::new("sample.bin".into(), vec![0xCA, 0xFE]);
+        let overlays = temporary_dir("round-trip-overlays");
+        let mut app =
+            App::with_overlay_dir("sample.bin".into(), vec![0xCA, 0xFE], overlays.clone());
         app.fields.push(Field {
             name: "magic".into(),
             description: "test".into(),
@@ -5605,6 +5992,7 @@ mod tests {
         assert_eq!(fs::read(&binary_path).unwrap(), vec![0xCA, 0xFE]);
         fs::remove_file(overlay_path).unwrap();
         fs::remove_file(binary_path).unwrap();
+        fs::remove_dir_all(overlays).unwrap();
     }
 
     #[test]

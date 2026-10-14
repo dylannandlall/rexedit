@@ -189,8 +189,27 @@ mod tests {
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Overlay {
+    /// Absent in overlays saved before metadata existed; those still load.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<OverlayMetadata>,
     pub fields: Vec<Field>,
+}
+
+/// Records which binary an overlay was made for. rexedit matches overlays
+/// to binaries by `content_id`; the other fields are for people browsing
+/// the overlay directory.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct OverlayMetadata {
+    pub format_version: u32,
+    pub file_name: String,
+    pub file_path: String,
+    pub file_size: u64,
+    pub content_id: String,
+    pub created: String,
+    pub updated: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
