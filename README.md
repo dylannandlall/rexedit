@@ -360,8 +360,12 @@ An overlay keeps the identity of the binary it was made for. If you load
 `other.bin`'s overlay onto a different binary and edit fields, the changes
 are saved into that overlay, but its metadata still names `other.bin`, so
 `other.bin` keeps opening it. An overlay made for the binary itself follows
-the binary instead: saving edited bytes with `Ctrl+S` updates its
-`content_id` so it still opens next time. `file_path` and `updated` record
+the binary instead: saving edited bytes over the same file with `Ctrl+S`
+updates its `content_id` so it still opens next time. Saving the binary to a
+*different* path leaves the original file's overlay untouched and gives the
+new file an overlay of its own, which becomes the open one. When identical
+copies of a binary each have an overlay, each copy opens the overlay recorded
+for its own path. `file_path` and `updated` record
 where the binary was and when rexedit last wrote the overlay; `created` never
 changes.
 
