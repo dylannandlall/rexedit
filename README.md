@@ -295,6 +295,11 @@ selections, rexedit creates one identically colored field per range. Fields supp
   the hex and ASCII columns;
 - selection, updating, and deletion.
 
+The field pane lists fields in file order: by start offset, then by name
+(case-insensitive) when two fields start at the same byte. The order is kept
+as fields are added, edited, loaded from an overlay, or shifted by inserting
+and deleting bytes, and the field you were working on stays selected.
+
 The text color/underline and the background always show together — there is
 no setting to show one without the other. Background defaults to "none" (no
 shading, matching rexedit's previous look); in the field editor, Tab to the
@@ -303,12 +308,49 @@ shading, matching rexedit's previous look); in the field editor, Tab to the
 background that contrasts with the text color for you — choosing a
 combination that stays readable is up to you.
 
-Overlays are stored as JSON files and can be saved or loaded using user-selected
-paths. The suggested filename is:
+Overlays are stored as JSON files. rexedit saves each binary's fields
+automatically, whenever a field changes and when the binary is saved or
+closed, to:
 
-```text
-<binary-name>.rexedit-overlay.json
+| Platform | Directory |
+| --- | --- |
+| Linux/BSD | `$XDG_DATA_HOME/rexedit/overlays` (or `~/.local/share/rexedit/overlays`) |
+| macOS | `~/Library/Application Support/rexedit/overlays` |
+| Windows | `%APPDATA%\rexedit\overlays` |
+
+Each file is named after its binary, `<file name>-overlay-<#>.json` (for
+example `firmware.bin-overlay-1.json`). `<#>` is the lowest number not
+already in use, so two different binaries that are both called
+`firmware.bin` get `-1` and `-2`. Characters that are unsafe in file names
+become `_`.
+
+Every overlay starts with a `metadata` block describing the binary it was
+made for:
+
+```json
+"metadata": {
+  "format_version": 1,
+  "file_name": "firmware.bin",
+  "file_path": "/home/user/samples/firmware.bin",
+  "file_size": 1048576,
+  "content_id": "0000000000100000…",
+  "created": "2026-10-14T13:47:08Z",
+  "updated": "2026-10-14T14:02:51Z"
+}
 ```
+
+When a binary is opened, rexedit finds its overlay by `content_id`, a
+fingerprint of the binary's contents, so renaming or moving the binary keeps
+its fields. `file_path` and `updated` record where the binary was and when
+rexedit last wrote the overlay; `created` never changes. Saving edited bytes with
+`Ctrl+S` updates the same overlay file's metadata rather than starting a new
+one. Overlays from older versions of rexedit, which were named only by a
+hash, are renamed and given metadata the first time their binary is opened.
+
+`Ctrl+O` and `Ctrl+L` save and load overlays at any path you choose; the
+path box starts at the binary's own overlay file. Loading an overlay whose
+metadata names a different binary still loads it, and the status bar says
+which binary it was made for.
 
 ## Custom inspector plugins
 
