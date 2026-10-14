@@ -709,6 +709,22 @@ impl App {
             .unwrap_or_default()
     }
 
+    /// The binary's path as recorded in overlay metadata.
+    fn canonical_path(&self) -> String {
+        fs::canonicalize(&self.path)
+            .unwrap_or_else(|_| self.path.clone())
+            .display()
+            .to_string()
+    }
+
+    fn binary_identity(&self) -> BinaryIdentity {
+        BinaryIdentity {
+            file_name: self.file_name(),
+            file_path: self.canonical_path(),
+            content_id: self.saved_content_id.clone(),
+        }
+    }
+
     /// The open overlay, or the name a new one for this binary would get.
     fn suggested_overlay_path(&self) -> PathBuf {
         self.overlay_path
@@ -740,7 +756,7 @@ impl App {
     /// first time its binary is opened.
     fn restore_automatic_overlay(&mut self) -> Result<Option<PathBuf>, String> {
         if let Some((path, overlay)) =
-            find_overlay_for_content(&self.overlay_dir, &self.file_name(), &self.saved_content_id)
+            find_overlay_for_content(&self.overlay_dir, &self.binary_identity())
         {
             self.apply_overlay_fields(overlay.fields);
             self.open_overlay(path.clone(), overlay.metadata);
@@ -816,10 +832,7 @@ impl App {
         OverlayMetadata {
             format_version: OVERLAY_FORMAT_VERSION,
             file_name: self.file_name(),
-            file_path: fs::canonicalize(&self.path)
-                .unwrap_or_else(|_| self.path.clone())
-                .display()
-                .to_string(),
+            file_path: self.canonical_path(),
             file_size: self.saved_bytes.len() as u64,
             content_id: self.saved_content_id.clone(),
             created: self
@@ -3998,22 +4011,42 @@ impl App {
 
     fn save_binary_to(&mut self, path: &Path) -> Result<String, String> {
         self.commit_pending_edit();
+        let previous_file = fs::canonicalize(&self.path).ok();
         fs::write(path, self.bytes.as_slice())
             .map_err(|error| format!("Could not save binary to {}: {error}", path.display()))?;
+        let saved_elsewhere =
+            previous_file.is_none() || previous_file != fs::canonicalize(path).ok();
+        let previous_name = self.file_name();
         self.path = path.to_owned();
         self.saved_bytes = Arc::clone(&self.bytes);
-        // The linked overlay keeps its file; its metadata follows the new content.
         self.saved_content_id = content_identity(&self.saved_bytes);
         self.modified_offsets.clear();
         self.undo_stack.clear();
         self.redo_stack.clear();
         self.quit_armed = false;
+        // Saving over the same file: this binary's overlay follows its new
+        // contents. Saving to another file: the original file is unchanged,
+        // so its overlay stays exactly as it is, and the new file gets an
+        // overlay of its own. (An overlay made for some other binary stays
+        // open either way, as with any autosave.)
+        let split_from_original =
+            saved_elsewhere && !self.overlay_foreign && self.overlay_path.is_some();
+        if split_from_original {
+            self.overlay_path = None;
+            self.overlay_origin = None;
+        }
         match self.persist_automatic_overlay() {
-            Ok(Some(overlay)) => Ok(format!(
-                "Saved binary to {}; overlay saved to {}",
-                path.display(),
-                overlay.display()
-            )),
+            Ok(Some(overlay)) => {
+                let mut message = format!(
+                    "Saved binary to {}; overlay saved to {}",
+                    path.display(),
+                    overlay.display()
+                );
+                if split_from_original {
+                    message.push_str(&format!(" ({previous_name} keeps its own overlay)"));
+                }
+                Ok(message)
+            }
             Ok(None) => Ok(format!("Saved binary to {}", path.display())),
             Err(error) => Ok(format!("Saved binary to {}; {error}", path.display())),
         }
@@ -4129,16 +4162,22 @@ fn allocate_overlay_path(dir: &Path, file_name: &str) -> io::Result<PathBuf> {
     }
 }
 
-/// Finds the overlay in `dir` whose metadata records `content_id`. When
-/// several do, the most recently saved (`updated`) wins, then one named
-/// after `file_name`, then the first by path. Files without metadata, that
-/// fail to parse, or that are `.bak` backups are skipped.
-fn find_overlay_for_content(
-    dir: &Path,
-    file_name: &str,
-    content_id: &str,
-) -> Option<(PathBuf, Overlay)> {
-    let likely_prefix = format!("{}-overlay-", overlay_name_stem(file_name));
+/// What overlay lookups know about the binary being opened.
+struct BinaryIdentity {
+    file_name: String,
+    file_path: String,
+    content_id: String,
+}
+
+/// Finds the overlay in `dir` made for `binary`: its metadata must record
+/// the binary's `content_id`. When several do (copies of the same file, or
+/// several overlays for one file), the preference is: the overlay recorded
+/// for this binary's exact path, then one recorded under its file name,
+/// then the most recently saved (`updated`), then one named after the
+/// binary, then the first by path. Files without metadata, that fail to
+/// parse, or that are `.bak` backups are skipped.
+fn find_overlay_for_content(dir: &Path, binary: &BinaryIdentity) -> Option<(PathBuf, Overlay)> {
+    let likely_prefix = format!("{}-overlay-", overlay_name_stem(&binary.file_name));
     let mut paths = fs::read_dir(dir)
         .ok()?
         .filter_map(Result::ok)
@@ -4149,31 +4188,35 @@ fn find_overlay_for_content(
         })
         .collect::<Vec<_>>();
     paths.sort();
-    let rank = |path: &Path, overlay: &Overlay| {
+    let rank = |path: &Path, metadata: &OverlayMetadata| {
         let named_after_binary = path
             .file_name()
             .is_some_and(|name| name.to_string_lossy().starts_with(&likely_prefix));
-        let updated = overlay
-            .metadata
-            .as_ref()
-            .map(|metadata| metadata.updated.clone());
-        (updated, named_after_binary)
+        (
+            metadata.file_path == binary.file_path,
+            metadata.file_name == binary.file_name,
+            metadata.updated.clone(),
+            named_after_binary,
+        )
     };
     let mut best: Option<(PathBuf, Overlay)> = None;
     for path in paths {
         let Ok(overlay) = read_overlay(&path) else {
             continue;
         };
-        if overlay
-            .metadata
-            .as_ref()
-            .is_none_or(|metadata| metadata.content_id != content_id)
-        {
+        let Some(metadata) = &overlay.metadata else {
+            continue;
+        };
+        if metadata.content_id != binary.content_id {
             continue;
         }
-        if best.as_ref().is_none_or(|(best_path, best_overlay)| {
-            rank(&path, &overlay) > rank(best_path, best_overlay)
-        }) {
+        let better = best.as_ref().is_none_or(|(best_path, best_overlay)| {
+            best_overlay
+                .metadata
+                .as_ref()
+                .is_none_or(|best_metadata| rank(&path, metadata) > rank(best_path, best_metadata))
+        });
+        if better {
             best = Some((path, overlay));
         }
     }
@@ -5445,6 +5488,88 @@ mod tests {
         // The backup is never mistaken for an overlay on the next open.
         let reopened = App::with_overlay_dir(binary, bytes, overlays.clone());
         assert_eq!(reopened.overlay_path, Some(overlay));
+
+        fs::remove_dir_all(overlays).unwrap();
+        fs::remove_dir_all(binary_dir).unwrap();
+    }
+
+    #[test]
+    fn saving_an_edited_binary_elsewhere_gives_the_copy_its_own_overlay() {
+        let overlays = temporary_dir("save-elsewhere-overlays");
+        let binary_dir = temporary_dir("save-elsewhere-binaries");
+        let original = binary_dir.join("fw.bin");
+        let patched = binary_dir.join("fw_patched.bin");
+        let bytes = vec![0xAA, 0xBB];
+        fs::write(&original, &bytes).unwrap();
+
+        let mut app = App::with_overlay_dir(original.clone(), bytes.clone(), overlays.clone());
+        add_field_via_editor(&mut app, "header", 0, 1);
+        app.selection = Some(Selection::new(0));
+        app.overwrite_nibble(0x1);
+        app.overwrite_nibble(0x2);
+        app.save_binary_to(&patched).unwrap();
+        add_field_via_editor(&mut app, "patched_only", 1, 1);
+
+        let original_overlay = overlays.join("fw.bin-overlay-1.json");
+        let patched_overlay = overlays.join("fw_patched.bin-overlay-1.json");
+        let original_metadata = &overlay_json(&original_overlay)["metadata"];
+        assert_eq!(original_metadata["file_name"], "fw.bin");
+        assert_eq!(original_metadata["content_id"], content_identity(&bytes));
+        assert_eq!(field_names_in(&original_overlay), vec!["header"]);
+        assert_eq!(app.overlay_path, Some(patched_overlay.clone()));
+        assert_eq!(
+            overlay_json(&patched_overlay)["metadata"]["content_id"],
+            content_identity(&[0x12, 0xBB])
+        );
+        assert_eq!(
+            field_names_in(&patched_overlay),
+            vec!["header", "patched_only"]
+        );
+
+        let reopened = App::with_overlay_dir(original, bytes, overlays.clone());
+        assert_eq!(reopened.overlay_path, Some(original_overlay));
+        assert_eq!(reopened.fields.len(), 1);
+        let reopened = App::with_overlay_dir(patched, vec![0x12, 0xBB], overlays.clone());
+        assert_eq!(reopened.overlay_path, Some(patched_overlay));
+        assert_eq!(reopened.fields.len(), 2);
+
+        fs::remove_dir_all(overlays).unwrap();
+        fs::remove_dir_all(binary_dir).unwrap();
+    }
+
+    #[test]
+    fn identical_copies_each_open_the_overlay_recorded_for_their_own_path() {
+        let overlays = temporary_dir("copy-overlays");
+        let binary_dir = temporary_dir("copy-binaries");
+        let original = binary_dir.join("fw.bin");
+        let copy = binary_dir.join("fw_copy.bin");
+        let bytes = vec![7, 7, 7];
+        fs::write(&original, &bytes).unwrap();
+
+        let mut app = App::with_overlay_dir(original.clone(), bytes.clone(), overlays.clone());
+        add_field_via_editor(&mut app, "in_original", 0, 0);
+        app.save_binary_to(&copy).unwrap();
+        add_field_via_editor(&mut app, "in_copy", 1, 1);
+
+        // Make the original's overlay clearly older than the copy's; the
+        // original must still open its own rather than the newer one.
+        let original_overlay = overlays.join("fw.bin-overlay-1.json");
+        let mut json = overlay_json(&original_overlay);
+        json["metadata"]["updated"] = "2020-01-01T00:00:00Z".into();
+        fs::write(&original_overlay, json.to_string()).unwrap();
+
+        let reopened = App::with_overlay_dir(original, bytes.clone(), overlays.clone());
+        assert_eq!(
+            reopened.overlay_path,
+            Some(overlays.join("fw.bin-overlay-1.json"))
+        );
+        assert_eq!(reopened.fields.len(), 1);
+        let reopened = App::with_overlay_dir(copy, bytes, overlays.clone());
+        assert_eq!(
+            reopened.overlay_path,
+            Some(overlays.join("fw_copy.bin-overlay-1.json"))
+        );
+        assert_eq!(reopened.fields.len(), 2);
 
         fs::remove_dir_all(overlays).unwrap();
         fs::remove_dir_all(binary_dir).unwrap();
