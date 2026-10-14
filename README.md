@@ -308,9 +308,11 @@ shading, matching rexedit's previous look); in the field editor, Tab to the
 background that contrasts with the text color for you — choosing a
 combination that stays readable is up to you.
 
-Overlays are stored as JSON files. rexedit saves each binary's fields
-automatically, whenever a field changes and when the binary is saved or
-closed, to:
+Overlays are stored as JSON files. Each open binary has one **open overlay**,
+shown in the status bar next to the field count (for example
+`3 fields (firmware.bin-overlay-1.json)`). rexedit autosaves the fields to
+the open overlay, and only to it, whenever a field changes and when the binary
+is saved or closed. New overlays are created in:
 
 | Platform | Directory |
 | --- | --- |
@@ -339,18 +341,37 @@ made for:
 }
 ```
 
-When a binary is opened, rexedit finds its overlay by `content_id`, a
-fingerprint of the binary's contents, so renaming or moving the binary keeps
-its fields. `file_path` and `updated` record where the binary was and when
-rexedit last wrote the overlay; `created` never changes. Saving edited bytes with
-`Ctrl+S` updates the same overlay file's metadata rather than starting a new
-one. Overlays from older versions of rexedit, which were named only by a
-hash, are renamed and given metadata the first time their binary is opened.
+Which overlay is open:
 
-`Ctrl+O` and `Ctrl+L` save and load overlays at any path you choose; the
-path box starts at the binary's own overlay file. Loading an overlay whose
-metadata names a different binary still loads it, and the status bar says
-which binary it was made for.
+- **Opening a binary** opens its overlay, found by `content_id`, a
+  fingerprint of the binary's contents, so renaming or moving the binary
+  keeps its fields. If several overlays match, the most recently saved one
+  (newest `updated`) opens. A binary with no overlay gets a new
+  `<file name>-overlay-<#>.json` when its first field is added.
+- **`Ctrl+L`** loads an overlay from any path and makes it the open overlay.
+  From then on, autosaves go to that file; the overlay that was open before
+  is left exactly as it was.
+- **`Ctrl+O`** saves to any path. Saving to the open overlay is an ordinary
+  save. Saving anywhere else works like "Save As": that file becomes the open
+  overlay and receives autosaves, and the previous one keeps its last saved
+  state. The path box for both starts at the open overlay.
+
+An overlay keeps the identity of the binary it was made for. If you load
+`other.bin`'s overlay onto a different binary and edit fields, the changes
+are saved into that overlay, but its metadata still names `other.bin`, so
+`other.bin` keeps opening it. An overlay made for the binary itself follows
+the binary instead: saving edited bytes with `Ctrl+S` updates its
+`content_id` so it still opens next time. `file_path` and `updated` record
+where the binary was and when rexedit last wrote the overlay; `created` never
+changes.
+
+The first time rexedit overwrites an existing overlay file during a session,
+it copies the previous version to `<overlay>.json.bak` next to it. To undo a
+session's changes to an overlay, replace the `.json` with its `.json.bak`.
+Backups are never opened as overlays.
+
+Overlays from older versions of rexedit, which were named only by a hash,
+are renamed and given metadata the first time their binary is opened.
 
 ## Custom inspector plugins
 

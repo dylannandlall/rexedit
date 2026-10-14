@@ -1006,9 +1006,12 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().add_modifier(Modifier::BOLD),
         ),
         Span::raw(format!(
-            "| {} bytes | {} fields | {}{dirty}{search}",
+            "| {} bytes | {} fields{} | {}{dirty}{search}",
             app.bytes.len(),
             app.fields.len(),
+            app.open_overlay_name()
+                .map(|name| format!(" ({name})"))
+                .unwrap_or_default(),
             selection_location_summary(app),
         )),
         mode_span,
